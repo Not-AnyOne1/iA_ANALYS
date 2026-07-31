@@ -1,0 +1,9 @@
+# Shell scripts must keep LF endings even when committed from Windows.
+# Git's core.autocrlf on Windows would otherwise rewrite docker-entrypoint.sh
+# with CRLF, and Linux then fails to run it — the container dies at startup
+# with "exec /usr/local/bin/docker-entrypoint.sh: no such file or directory"
+# (the \r becomes part of the interpreter path). Pinning it here makes the
+# checkout correct regardless of the contributor's git settings.
+*.sh text eol=lf
+Dockerfile text eol=lf
+docker-entrypoint.sh text eol=lf

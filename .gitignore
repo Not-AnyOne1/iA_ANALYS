@@ -1,0 +1,32 @@
+# Secrets — never commit
+.env
+
+# Telethon session files grant full access to the logged-in account
+*.session
+*.session-journal
+
+# Output of `python railway_secrets.py --out` — contains the base64-encoded
+# Telegram session and Claude credentials.
+.railway-secrets.txt
+
+# Output
+data/
+logs/
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

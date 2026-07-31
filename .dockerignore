@@ -1,0 +1,45 @@
+# Secrets — these must NEVER be baked into an image layer.
+# Both are supplied at runtime instead, as base64 environment variables that
+# docker-entrypoint.sh decodes onto the volume; see README.
+.env
+*.session
+*.session-journal
+.railway-secrets.txt
+
+# Local runtime output — the deployed app writes these to the persistent disk.
+data/
+logs/
+*.jsonl
+
+# Local virtualenv (the image installs its own dependencies).
+.venv/
+venv/
+env/
+
+# Tests and dev-only tooling: not needed to run the worker.
+tests/
+pytest.ini
+requirements-dev.txt
+# Deployment helper, run on your own machine only.
+railway_secrets.py
+
+# Python bytecode / tool caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# VCS, editors, OS noise
+.git/
+.gitignore
+.claude/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docs and deployment descriptors aren't needed inside the image itself.
+README.md
+railway.json

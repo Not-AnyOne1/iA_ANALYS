@@ -1,0 +1,4 @@
+# Development/test-only dependencies. Not needed to run the monitor itself.
+-r requirements.txt
+
+pytest>=8.0

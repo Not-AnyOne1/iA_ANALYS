@@ -1,0 +1,32 @@
+# Telegram MTProto client (user account, not the Bot API).
+telethon>=1.44.0,<2.0.0
+
+# Optional but strongly recommended by Telethon: C accelerators for MTProto
+# crypto. Pure-Python fallback is used automatically if this is unavailable.
+cryptg>=0.5.0
+
+# .env loading.
+python-dotenv>=1.0.0
+
+# Schema for the structured analysis returned by the Claude Code CLI's
+# --json-schema flag, and validation of the parsed result.
+pydantic>=2.7.0,<3.0.0
+
+# Telegram Bot API client (RFC-002) — a fully separate credential/session
+# from the Telethon user-account client above. Optional at runtime: if
+# TELEGRAM_BOT_TOKEN/TELEGRAM_BOT_CHAT_ID aren't set, the bot simply never
+# starts, but the package still needs to be installed.
+python-telegram-bot>=21.0,<22.0
+
+# Async HTTP client for the market data layer (RFC-004), used to call the
+# Twelve Data REST API. Already installed transitively via
+# python-telegram-bot; listed explicitly here because market_data.py
+# imports it directly.
+httpx>=0.27.0
+
+# NOTE: analysis is NOT done via the `anthropic` Python package or any API
+# key. It runs through the locally installed Claude Code CLI as a subprocess.
+# Install it separately (it's a Node CLI, not a pip package):
+#
+#   npm install -g @anthropic-ai/claude-code
+#   claude auth login
