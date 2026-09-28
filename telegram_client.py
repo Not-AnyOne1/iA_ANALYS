@@ -12,7 +12,7 @@ import logging
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from telethon import TelegramClient, events, utils
 from telethon.errors import (
@@ -83,7 +83,14 @@ def _classify_chat_type(entity: Any) -> str:
 class TelegramMonitor:
     """Owns the Telethon client and feeds messages into ``queue``."""
 
-    def __init__(self, settings: Settings, queue: "asyncio.Queue[IncomingMessage]") -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        queue: "asyncio.Queue[IncomingMessage]",
+        *,
+        ignore_sender_ids: Iterable[int] = (),
+        ignore_usernames: Iterable[str] = (),
+    ) -> None:
         self._settings = settings
         self._queue = queue
         self._stopping = asyncio.Event()
@@ -91,6 +98,17 @@ class TelegramMonitor:
         self._chat_title: str = "unknown"
         self._chat_username: str | None = None
         self._dropped = 0
+        # Authors whose messages never enter the pipeline. Populated in
+        # main.py with our own bot's identity: when the bot posts into the
+        # chat this monitor watches, its report arrives back here as an
+        # ordinary message and would be analysed, producing another report,
+        # forever. Ids are preferred (exact, no API call); usernames are a
+        # fallback for the case where the id could not be determined.
+        self._ignored_sender_ids = frozenset(ignore_sender_ids)
+        self._ignored_usernames = frozenset(
+            u.lstrip("@").lower() for u in ignore_usernames if u
+        )
+        self._ignored_messages = 0
 
         self._client = TelegramClient(
             settings.session_path,
@@ -236,6 +254,17 @@ class TelegramMonitor:
                 log.debug("Skipping message %s with no text", event.message.id)
                 return
 
+            # Before the queue, deliberately: anything that reaches the
+            # pipeline is analysed, and an analysis of our own report is
+            # what starts the loop.
+            if await self._is_own_bot(event):
+                self._ignored_messages += 1
+                log.debug(
+                    "Ignoring message %s from our own bot (%d ignored total)",
+                    event.message.id, self._ignored_messages,
+                )
+                return
+
             message = IncomingMessage(
                 id=event.message.id,
                 chat_id=event.chat_id,
@@ -259,6 +288,35 @@ class TelegramMonitor:
                 )
         except Exception:  # noqa: BLE001 - a handler must never kill the update loop
             log.exception("Failed to enqueue an incoming message")
+
+    async def _is_own_bot(self, event: Any) -> bool:
+        """True when this message was posted by our own Telegram bot.
+
+        Checks the sender id first: it is exact, needs no API call, and is
+        derived from the bot token at startup. The username check is only a
+        fallback for a deployment whose token could not be parsed, and is
+        skipped entirely when no usernames are configured so the common path
+        stays free of an extra sender lookup.
+
+        Never raises — a filter that fails open would restart the loop, so a
+        lookup failure is treated as "cannot confirm it is ours" only after
+        the cheap id check has already said no.
+        """
+        if not self._ignored_sender_ids and not self._ignored_usernames:
+            return False
+
+        sender_id = getattr(event.message, "sender_id", None)
+        if sender_id is not None and sender_id in self._ignored_sender_ids:
+            return True
+
+        if not self._ignored_usernames:
+            return False
+        try:
+            sender = await event.get_sender()
+        except Exception:  # noqa: BLE001 - treated as "not ours", see above
+            return False
+        username = getattr(sender, "username", None)
+        return bool(username) and username.lower() in self._ignored_usernames
 
     async def _describe_sender(self, event: Any) -> str:
         """Best-effort human-readable author, tolerant of anonymous posts."""

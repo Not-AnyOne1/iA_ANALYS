@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import os
 import signal
 import sys
 from datetime import datetime, timezone
@@ -214,12 +215,35 @@ async def run_monitor(settings: Settings, formatter: Formatter) -> int:
         log.error("%s", exc)
         return EXIT_CONFIG
 
-    monitor = TelegramMonitor(settings, queue)
     # RFC-002: entirely optional and independent of the Telethon session
     # above — a separate Bot API credential. If TELEGRAM_BOT_TOKEN/
     # TELEGRAM_BOT_CHAT_ID aren't set, bot.start() below is a no-op and
     # nothing about the rest of this function changes.
-    bot = TelegramBot(BotSettings.from_env())
+    bot_settings = BotSettings.from_env()
+    bot = TelegramBot(bot_settings)
+
+    # The monitor must never analyse what this bot posted. When the bot's
+    # destination is the chat being monitored, its report comes straight
+    # back as an ordinary message; analysing it produces another report, and
+    # so on without end. The id comes from the bot token, so no extra
+    # configuration is needed; TELEGRAM_BOT_USERNAME is an optional fallback
+    # for a token this cannot parse.
+    own_bot_ids = [i for i in (bot_settings.bot_user_id,) if i is not None]
+    own_bot_usernames = [u for u in (os.getenv("TELEGRAM_BOT_USERNAME", "").strip(),) if u]
+    if own_bot_ids or own_bot_usernames:
+        log.info("self_filter_enabled bot_user_id=%s bot_username=%s",
+                 own_bot_ids or None, own_bot_usernames or None)
+    elif bot_settings.enabled:
+        log.warning(
+            "self_filter_unavailable — the bot token could not be parsed for a "
+            "user id and TELEGRAM_BOT_USERNAME is unset; if the bot posts into "
+            "the monitored chat its own reports will be analysed"
+        )
+    monitor = TelegramMonitor(
+        settings, queue,
+        ignore_sender_ids=own_bot_ids,
+        ignore_usernames=own_bot_usernames,
+    )
     # RFC-003: persists completed analyses so /latest, /history and /stats
     # survive a restart. A storage failure must never take down the monitor
     # any more than a bot misconfiguration can — if initialize() fails,

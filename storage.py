@@ -82,6 +82,15 @@ CREATE TABLE IF NOT EXISTS analyses (
     analysis_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_analyses_id ON analyses(id);
+
+-- Bot report recipients. One row per private chat that sent /start; the row
+-- is deleted on /stop. Kept here rather than in a side file so a restart
+-- (or a redeploy onto the Railway volume) keeps the audience it already had.
+CREATE TABLE IF NOT EXISTS subscribers (
+    chat_id INTEGER PRIMARY KEY,
+    username TEXT,
+    subscribed_at TEXT NOT NULL
+);
 """
 
 # RFC-009: additive columns, all nullable. Added via ALTER TABLE (guarded by
@@ -348,6 +357,56 @@ class Storage:
         """The most recently recorded analysis, or ``None`` if none yet."""
         rows = await self.history(limit=1)
         return rows[0] if rows else None
+
+    # ------------------------------------------------------------ subscribers
+
+    async def add_subscriber(self, chat_id: int, username: Optional[str] = None) -> bool:
+        """Register a chat to receive reports. True if newly added.
+
+        Idempotent: sending /start twice registers once and reports False the
+        second time, so the bot can tell the user they were already signed up.
+        """
+        return await asyncio.to_thread(self._add_subscriber_sync, chat_id, username)
+
+    def _add_subscriber_sync(self, chat_id: int, username: Optional[str]) -> bool:
+        conn = self._connect()
+        try:
+            with conn:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO subscribers (chat_id, username, subscribed_at) "
+                    "VALUES (?, ?, ?)",
+                    (chat_id, username, datetime.now(timezone.utc).isoformat()),
+                )
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    async def remove_subscriber(self, chat_id: int) -> bool:
+        """Unregister a chat. True if it had been registered."""
+        return await asyncio.to_thread(self._remove_subscriber_sync, chat_id)
+
+    def _remove_subscriber_sync(self, chat_id: int) -> bool:
+        conn = self._connect()
+        try:
+            with conn:
+                cur = conn.execute("DELETE FROM subscribers WHERE chat_id = ?", (chat_id,))
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    async def subscribers(self) -> List[int]:
+        """Every registered chat id, oldest subscription first."""
+        return await asyncio.to_thread(self._subscribers_sync)
+
+    def _subscribers_sync(self) -> List[int]:
+        conn = self._connect()
+        try:
+            return [int(row[0]) for row in conn.execute(
+                "SELECT chat_id FROM subscribers ORDER BY subscribed_at, chat_id")]
+        finally:
+            conn.close()
+
+    # --------------------------------------------------------------- history
 
     async def history(self, limit: int) -> List[StoredAnalysis]:
         """The ``limit`` most recent analyses, most recent first."""

@@ -45,7 +45,7 @@ import re
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, Tuple, TYPE_CHECKING, Union
+from typing import List, Optional, TYPE_CHECKING, Tuple, Union
 
 from pydantic import BaseModel, Field
 from telegram import Bot, Update
@@ -86,9 +86,33 @@ class BotSettings(BaseModel):
     dedup_cache_size: int = Field(default=2000, ge=1)
 
     @property
+    def bot_user_id(self) -> Optional[int]:
+        """This bot's own Telegram user id, read from the token.
+
+        A bot token is ``<user_id>:<secret>``, so the id is available at
+        startup with no API call and no extra configuration. The monitor
+        uses it to refuse messages this bot itself posted — without that,
+        a bot whose destination is the monitored chat reads its own report
+        back and analyses it forever.
+
+        Returns ``None`` for a malformed or absent token rather than
+        raising: a filter that cannot be built must not stop the bot.
+        """
+        if not self.bot_token:
+            return None
+        head, _, _ = self.bot_token.partition(":")
+        return int(head) if head.isdigit() else None
+
+    @property
     def enabled(self) -> bool:
-        """True only when both the token and a target chat are configured."""
-        return bool(self.bot_token) and self.chat_id is not None
+        """True as soon as a token is configured.
+
+        A target chat is no longer required: reports go to whoever sent
+        /start, and that audience is built at runtime. ``chat_id`` remains
+        only as a backward-compatible fallback for deployments that set it
+        before subscriptions existed — see :meth:`TelegramBot._destinations`.
+        """
+        return bool(self.bot_token)
 
     @classmethod
     def from_env(cls) -> "BotSettings":
@@ -200,6 +224,9 @@ class TelegramBot:
         self._sent_ids = _BoundedSet(settings.dedup_cache_size)
         self._stats = BotStats()
         self._storage: Optional[Storage] = None
+        # Report recipients, mirrored from storage so the sync
+        # authorization check does not need a database round-trip.
+        self._subscribers: set[int] = set()
         self._market_data: Optional[MarketDataService] = None
         self._statistics: Optional[Statistics] = None
 
@@ -249,6 +276,7 @@ class TelegramBot:
         self._application = ApplicationBuilder().token(self._settings.bot_token).build()
         for command, handler in (
             ("start", self._cmd_start),
+            ("stop", self._cmd_stop),
             ("help", self._cmd_help),
             ("status", self._cmd_status),
             ("stats", self._cmd_stats),
@@ -263,7 +291,22 @@ class TelegramBot:
         assert self._application.updater is not None
         await self._application.updater.start_polling()
         self._started_at = datetime.now(timezone.utc)
-        log.info("bot_started chat_id=%s", self._settings.chat_id)
+        await self._load_subscribers()
+        log.info("bot_started subscribers=%d fallback_chat_id=%s",
+                 len(self._subscribers), self._settings.chat_id)
+
+    async def _load_subscribers(self) -> None:
+        """Restore the audience persisted by previous runs.
+
+        Best-effort: a storage fault leaves the set empty, which falls
+        back to TELEGRAM_BOT_CHAT_ID rather than stopping the bot.
+        """
+        if self._storage is None:
+            return
+        try:
+            self._subscribers = set(await self._storage.subscribers())
+        except Exception:  # noqa: BLE001 - never block startup
+            log.exception("bot_subscriber_load_failed")
 
     async def stop(self) -> None:
         """Stop polling and release resources. No-op if never started."""
@@ -299,7 +342,8 @@ class TelegramBot:
 
         text = self._format_notification(message, analysis)
         try:
-            await self._send_with_retry(text)
+            for destination in self._destinations():
+                await self._send_with_retry(text, destination)
         except Exception as exc:  # noqa: BLE001 - the one rule that must never break
             self._stats.notifications_failed += 1
             log.error(
@@ -344,46 +388,88 @@ class TelegramBot:
             log.debug("bot_report_skip_duplicate chat_id=%s message_id=%s", *key)
             return
 
-        try:
-            try:
-                await self._send_with_retry(html_text, reply_to_message_id=message.id)
-            except BadRequest as exc:
-                if not _is_missing_reply_target(exc):
-                    raise
-                log.info(
-                    "bot_report_reply_unavailable chat_id=%s message_id=%s (%s) "
-                    "— sending as a normal message",
-                    message.chat_id, message.id, exc,
-                )
-                await self._send_with_retry(html_text)
-        except Exception as exc:  # noqa: BLE001 - delivery must never break the pipeline
-            self._stats.notifications_failed += 1
-            log.error(
-                "bot_report_failed chat_id=%s message_id=%s error=%s: %s",
-                message.chat_id, message.id, type(exc).__name__, exc,
+        destinations = self._destinations()
+        if not destinations:
+            log.info(
+                "bot_report_no_subscribers message_id=%s — nobody has sent /start "
+                "and no TELEGRAM_BOT_CHAT_ID fallback is configured",
+                message.id,
             )
+            return
+
+        # One failing subscriber (blocked the bot, deleted the chat) must not
+        # cost the others their report, so each destination is attempted
+        # independently and the failures are counted, not raised.
+        delivered = 0
+        for destination in destinations:
+            try:
+                await self._send_to(destination, message, html_text)
+            except Exception as exc:  # noqa: BLE001 - delivery never breaks the pipeline
+                self._stats.notifications_failed += 1
+                log.error(
+                    "bot_report_failed destination=%s message_id=%s error=%s: %s",
+                    destination, message.id, type(exc).__name__, exc,
+                )
+            else:
+                delivered += 1
+
+        if not delivered:
             return
 
         self._sent_ids.add(key)
         self._stats.notifications_sent += 1
-        log.info("bot_report_sent chat_id=%s message_id=%s chars=%d",
-                 message.chat_id, message.id, len(html_text))
+        log.info("bot_report_sent message_id=%s delivered=%d/%d chars=%d",
+                 message.id, delivered, len(destinations), len(html_text))
+
+    def _destinations(self) -> List[ChatRef]:
+        """Who the next report goes to.
+
+        Registered subscribers are the destination. ``TELEGRAM_BOT_CHAT_ID``
+        is a *fallback*, used only when nobody has subscribed — that keeps a
+        deployment configured before subscriptions existed working unchanged,
+        without making a hard-coded chat the primary target again.
+        """
+        if self._subscribers:
+            return sorted(self._subscribers)
+        return [self._settings.chat_id] if self._settings.chat_id is not None else []
+
+    async def _send_to(
+        self, destination: ChatRef, message: "IncomingMessage", html_text: str
+    ) -> None:
+        """Deliver one report to one chat, replying where that is meaningful.
+
+        A reply only makes sense in the chat the signal came from. For a
+        subscriber's private chat the group's message id does not exist, so
+        no reply is attempted rather than provoking a rejection and retrying.
+        """
+        reply_to = message.id if destination == message.chat_id else None
+        try:
+            await self._send_with_retry(html_text, destination, reply_to_message_id=reply_to)
+        except BadRequest as exc:
+            if reply_to is None or not _is_missing_reply_target(exc):
+                raise
+            log.info(
+                "bot_report_reply_unavailable destination=%s message_id=%s (%s) "
+                "— sending as a normal message",
+                destination, message.id, exc,
+            )
+            await self._send_with_retry(html_text, destination)
 
     async def _send_with_retry(
-        self, text: str, *, reply_to_message_id: Optional[int] = None
+        self, text: str, chat_id: ChatRef, *, reply_to_message_id: Optional[int] = None
     ) -> None:
-        """Send ``text`` to the configured chat, retrying transient failures
-        with exponential backoff (and honouring Telegram's own requested
-        delay on rate limits). Raises on the final failed attempt or on any
-        permanent (non-retryable) error — callers must catch."""
-        assert self._bot is not None and self._settings.chat_id is not None
+        """Send ``text`` to ``chat_id``, retrying transient failures with
+        exponential backoff (and honouring Telegram's own requested delay on
+        rate limits). Raises on the final failed attempt or on any permanent
+        (non-retryable) error — callers must catch."""
+        assert self._bot is not None
         attempts = self._settings.max_retries + 1
         extra = {"reply_to_message_id": reply_to_message_id} if reply_to_message_id else {}
 
         for attempt in range(1, attempts + 1):
             try:
                 await self._bot.send_message(
-                    chat_id=self._settings.chat_id,
+                    chat_id=chat_id,
                     text=text,
                     parse_mode=ParseMode.HTML,
                     **extra,
@@ -458,31 +544,101 @@ class TelegramBot:
 
     # ------------------------------------------------------------------ commands
 
+    def _is_configured_chat(self, update: Update) -> bool:
+        """True for the legacy ``TELEGRAM_BOT_CHAT_ID``, if one is set."""
+        chat = update.effective_chat
+        configured = self._settings.chat_id
+        if chat is None or configured is None:
+            return False
+        if isinstance(configured, int):
+            return chat.id == configured
+        return (chat.username or "").lower() == str(configured).lstrip("@").lower()
+
     def _is_authorized_chat(self, update: Update) -> bool:
-        """Only answer commands from the configured chat.
+        """Only answer informational commands to a subscriber.
 
         ``/status``/``/stats`` reveal operational details about a private
-        pipeline; without this, anyone who finds the bot's username could
-        query it directly.
+        pipeline, so they stay behind a check. The check is now membership
+        rather than a single hard-coded chat: subscribing with /start is what
+        grants access, and /stop revokes it. The legacy configured chat still
+        counts, so an existing deployment keeps working untouched.
+
+        ``/start`` and ``/stop`` deliberately do NOT go through here — you
+        cannot subscribe if subscribing is what unlocks the door.
         """
         chat = update.effective_chat
-        if chat is None or self._settings.chat_id is None:
+        if chat is None:
             return False
-        if isinstance(self._settings.chat_id, int):
-            return chat.id == self._settings.chat_id
-        return (chat.username or "").lower() == str(self._settings.chat_id).lstrip("@").lower()
+        return chat.id in self._subscribers or self._is_configured_chat(update)
 
     async def _reply(self, update: Update, text: str) -> None:
         if update.message is not None:
             await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._is_authorized_chat(update):
+        """Register the sender to receive every final report.
+
+        Open by design — this is how the audience is built. Private chats
+        only: registering a group would send one report to every member of
+        it, which is a different feature and not what was asked for.
+        """
+        chat = update.effective_chat
+        if chat is None:
             return
+        if chat.type != "private":
+            await self._reply(
+                update,
+                "Send /start to me in a private chat to subscribe to reports.",
+            )
+            return
+
+        # Coerce to a real string or None: this goes straight into SQLite,
+        # which refuses to bind anything else, and the column is decorative.
+        raw = getattr(chat, "username", None) or getattr(chat, "first_name", None)
+        username = raw if isinstance(raw, str) else None
+        added = True
+        if self._storage is not None:
+            try:
+                added = await self._storage.add_subscriber(chat.id, username)
+            except Exception:  # noqa: BLE001 - a storage fault must not lose the user
+                log.exception("bot_subscribe_persist_failed chat_id=%s", chat.id)
+        else:
+            added = chat.id not in self._subscribers
+        self._subscribers.add(chat.id)
+
+        log.info("bot_subscribed chat_id=%s username=%s new=%s total=%d",
+                 chat.id, username, added, len(self._subscribers))
         await self._reply(
             update,
-            "This bot relays trading-signal analyses from your monitored "
-            "Telegram group automatically. Use /help to see available commands.",
+            ("You are subscribed — every completed analysis will be sent here.\n\n"
+             if added else
+             "You were already subscribed.\n\n")
+            + "Use /stop to unsubscribe, or /help to see the other commands.",
+        )
+
+    async def _cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Unregister the sender. Open for the same reason as /start: a
+        subscriber must always be able to leave."""
+        chat = update.effective_chat
+        if chat is None:
+            return
+
+        removed = chat.id in self._subscribers
+        if self._storage is not None:
+            try:
+                removed = await self._storage.remove_subscriber(chat.id)
+            except Exception:  # noqa: BLE001
+                log.exception("bot_unsubscribe_persist_failed chat_id=%s", chat.id)
+        self._subscribers.discard(chat.id)
+
+        log.info("bot_unsubscribed chat_id=%s was_subscribed=%s total=%d",
+                 chat.id, removed, len(self._subscribers))
+        await self._reply(
+            update,
+            "You are unsubscribed — no further reports will be sent here. "
+            "Send /start to resubscribe."
+            if removed else
+            "You were not subscribed. Send /start to subscribe.",
         )
 
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -491,7 +647,8 @@ class TelegramBot:
         await self._reply(
             update,
             "<b>Commands</b>\n"
-            "/start — introduction\n"
+            "/start — subscribe to reports\n"
+            "/stop — unsubscribe\n"
             "/help — this message\n"
             "/status — bot uptime and pipeline health\n"
             "/stats — persistent analysis statistics (signals, confidence, "

@@ -128,9 +128,12 @@ def test_every_listed_check_runs():
 
 
 def test_score_is_bounded():
+    """Each side has its own budget: the review may add up to
+    MAX_ADJUSTMENT and remove up to MAX_PENALTY, and neither depends on the
+    deterministic score."""
     r = _validate(_context())
     assert 0 <= r.bonus <= ve.MAX_ADJUSTMENT
-    assert 0 <= r.penalty <= ve.MAX_ADJUSTMENT
+    assert 0 <= r.penalty <= ve.MAX_PENALTY
 
 
 def test_validation_is_deterministic():
@@ -284,11 +287,17 @@ def test_imminent_news_is_scored_not_vetoed():
     assert not _validate(ctx).has_fatal
 
 
-def test_the_blockers_risk_engine_owns_still_reduce_the_score():
-    """Demoted, not softened — each still costs the full weight."""
-    clean = _validate(_context()).adjustment
+def test_execution_findings_are_reported_but_do_not_move_confidence():
+    """A wide spread is a real finding and still reaches the report, the
+    risk engine and Claude — it just says nothing about which way price is
+    going, so it cannot change how confident we are in the direction."""
+    clean = _validate(_context())
     wide = _context(); wide.spread = 1.0
-    assert _validate(wide).adjustment < clean
+    result = _validate(wide)
+
+    assert _check(result, "spread").severity is ve.Severity.WEAKNESS   # still found
+    assert "spread" in {c.name for c in result.weaknesses}             # still reported
+    assert result.adjustment == clean.adjustment                       # confidence untouched
 
 
 # ------------------------------------------------- judgement rules (weaknesses)
@@ -450,10 +459,15 @@ def test_a_tight_stop_still_reduces_the_score():
             current_price=100.0, atr_value=2.0)
         return ctx
 
-    tight = _validate(context_with_stop(mae * 0.5)).adjustment      # inside the excursion
-    generous = _validate(context_with_stop(mae * 2.0)).adjustment   # comfortably clear
+    tight_ctx = context_with_stop(mae * 0.5)      # stop inside the excursion
+    generous_ctx = context_with_stop(mae * 2.0)   # stop comfortably clear
+    tight, generous = _validate(tight_ctx), _validate(generous_ctx)
 
-    assert tight < generous
+    # The finding is still made, and still says the tight stop is worse...
+    assert _check(tight, "max_adverse_excursion").severity is ve.Severity.WEAKNESS
+    assert _check(generous, "max_adverse_excursion").severity is ve.Severity.STRENGTH
+    # ...but stop width is trade management, so confidence does not move.
+    assert tight.adjustment == generous.adjustment
 
 
 def test_the_severe_mae_case_costs_more_than_the_marginal_one():
@@ -596,3 +610,210 @@ def test_mixed_higher_timeframes_survive_a_full_validation():
     assert _check(result, "higher_timeframe_trend").severity is ve.Severity.WEAKNESS
     assert 0 <= result.bonus <= ve.MAX_ADJUSTMENT
     assert 0 <= result.penalty <= ve.MAX_ADJUSTMENT
+
+
+# ------------------------------------------------- nonlinear review adjustment
+
+def _adj(deterministic, positive_weight, negative_weight, total=106.0):
+    """Drive the adjustment directly from weighted evidence.
+
+    ``deterministic`` is accepted only so the call sites read naturally; the
+    penalty deliberately does NOT depend on it — see the test below.
+    """
+    checks = (
+        ve.ValidationCheck("pos", ve.Severity.STRENGTH, positive_weight, positive_weight, ""),
+        ve.ValidationCheck("neg", ve.Severity.WEAKNESS, -negative_weight, negative_weight, ""),
+        ve.ValidationCheck("rest", ve.Severity.UNKNOWN, 0.0,
+                           max(0.0, total - positive_weight - negative_weight), ""),
+    )
+    return ve.ValidationEngine._adjustments(checks)
+
+
+def _final(deterministic, positive_weight, negative_weight):
+    bonus, penalty = _adj(deterministic, positive_weight, negative_weight)
+    return max(0, min(100, deterministic + bonus - penalty))
+
+
+def test_a_strong_score_cannot_outrun_overwhelming_opposition():
+    """The reported defect: deterministic 92 with the review 5x against it
+    used to land on 79 (ENTER) because the penalty was capped at 25."""
+    assert _final(92, 0.12 * 106, 0.64 * 106) < 60
+
+
+def test_the_response_curve_accelerates_with_opposition():
+    """Convexity, measured on the penalty itself.
+
+    Evenly spaced steps of opposition must cost strictly more each time —
+    that is what "small disagreement -> tiny, overwhelming -> collapse"
+    means as a curve rather than as a table of thresholds.
+    """
+    penalties = [_adj(80, (1 - f) * 106, f * 106)[1]
+                 for f in (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)]
+    steps = [b - a for a, b in zip(penalties, penalties[1:])]
+
+    assert penalties[0] == 0                 # no opposition, no penalty
+    assert penalties[1] <= 5                 # small disagreement -> tiny
+    assert penalties[-1] == 80               # total opposition -> collapse
+    assert steps == sorted(steps), f"not convex: {penalties} -> {steps}"
+    assert steps[-1] > 2 * steps[0]          # and markedly so
+
+
+def test_confidence_never_rises_as_opposition_grows():
+    for deterministic in (0, 25, 50, 75, 100):
+        for pos in range(0, 107, 5):
+            scores = [_final(deterministic, pos, neg) for neg in range(0, 107 - pos, 5)]
+            assert scores == sorted(scores, reverse=True), (deterministic, pos, scores)
+
+
+def test_confidence_never_falls_as_support_grows():
+    for deterministic in (0, 25, 50, 75, 100):
+        for neg in range(0, 107, 5):
+            scores = [_final(deterministic, pos, neg) for pos in range(0, 107 - neg, 5)]
+            assert scores == sorted(scores), (deterministic, neg, scores)
+
+
+def test_the_adjustment_is_smooth():
+    """No step, no threshold: one unit of weight can never move confidence
+    by more than a point."""
+    for deterministic in (50, 80, 100):
+        vals = [_final(deterministic, 20, neg) for neg in range(0, 87)]
+        assert max(abs(b - a) for a, b in zip(vals, vals[1:])) <= 1
+
+
+def test_no_opposition_means_no_penalty():
+    assert _adj(90, 0.8 * 106, 0.0)[1] == 0
+    assert _adj(90, 0.0, 0.0)[1] == 0
+
+
+def test_thin_opposition_cannot_collapse_a_score():
+    """One small check firing alone is lopsided (100% of what spoke) but is
+    still only a sliver of the evidence base — the N/T factor sees that."""
+    assert _final(90, 0.0, 6.0) >= 85
+
+
+def test_the_bonus_is_unchanged_and_still_bounded():
+    for pos in (0, 20, 53, 106):
+        assert _adj(80, pos, 0.0)[0] == round(ve.MAX_ADJUSTMENT * pos / 106.0)
+        assert _adj(80, pos, 0.0)[0] <= ve.MAX_ADJUSTMENT
+
+
+def test_the_penalty_does_not_depend_on_the_deterministic_score():
+    """The review is a brake, not a second opinion on how strong the setup
+    is. Identical evidence must cost identical points at every score —
+    scaling by the score made the brake bite hardest exactly where
+    conviction was highest, which is backwards.
+    """
+    penalties = {_adj(D, 0.2 * 106, 0.6 * 106)[1] for D in (0, 25, 50, 75, 100)}
+    assert len(penalties) == 1, f"penalty varied with the score: {penalties}"
+
+
+def test_a_strong_setup_survives_moderate_opposition():
+    """The brake must not reject good trades: balanced evidence leaves a
+    strong deterministic reading in ENTER, and only marginal ones fall."""
+    for D in (75, 80, 85, 92, 100):
+        assert _final(D, 0.5 * 106, 0.5 * 106) >= 60, D
+    assert _final(65, 0.5 * 106, 0.5 * 106) < 60      # marginal ENTER -> WAIT
+
+
+def test_the_penalty_is_bounded_by_its_budget():
+    for pos in range(0, 107, 5):
+        for neg in range(0, 107 - pos, 5):
+            assert 0 <= _adj(80, pos, neg)[1] <= ve.MAX_PENALTY
+
+
+def test_the_adjustment_is_deterministic():
+    assert _adj(77, 30.0, 40.0) == _adj(77, 30.0, 40.0)
+
+
+# ------------------------------------- confidence is directional evidence only
+
+def _setup(stop_loss=94.0, take_profits=(120.0,), entries=(100.0,)):
+    return assess_quality(
+        TradeSetup(symbol="XAUUSD", direction="long", order_type="limit",
+                   entries=list(entries), stop_loss=stop_loss,
+                   take_profits=list(take_profits)),
+        current_price=100.0, atr_value=2.0)
+
+
+@pytest.mark.parametrize("stop_loss,take_profits", [
+    (99.0, (101.0,)),        # tight stop, poor 1:1 payoff
+    (94.0, (120.0,)),        # the baseline
+    (80.0, (140.0,)),        # very wide stop, generous payoff
+    (99.5, (160.0,)),        # razor stop, enormous payoff
+    (60.0, (101.0,)),        # absurd stop, feeble payoff
+])
+def test_changing_sl_and_tp_never_changes_confidence(stop_loss, take_profits):
+    """The stated requirement, directly: same market analysis, different
+    trade management, identical confidence."""
+    baseline = _validate(_context())
+    ctx = _context()
+    ctx.quality = _setup(stop_loss, take_profits)
+
+    result = _validate(ctx)
+
+    assert result.bonus == baseline.bonus
+    assert result.penalty == baseline.penalty
+
+
+def test_a_perfect_payoff_cannot_rescue_a_weak_analysis():
+    """A 1:3 R:R must never raise confidence when the read is poor."""
+    weak = _context()                       # long into bearish higher timeframes
+    weak.timeframes["D1"] = _tf("bearish")
+    weak.timeframes["H4"] = _tf("bearish")
+
+    thin_payoff = _validate(weak).adjustment
+    weak.quality = _setup(stop_loss=99.0, take_profits=(103.0,))   # R:R 1:3
+    assert _validate(weak).adjustment == thin_payoff
+
+
+def test_changing_the_market_analysis_does_change_confidence():
+    """The other half of the contract — confidence is not simply inert."""
+    bullish = _validate(_context()).adjustment
+    bearish = _context()
+    bearish.timeframes["D1"] = _tf("bearish")
+    bearish.timeframes["H4"] = _tf("bearish")
+
+    assert _validate(bearish).adjustment < bullish
+
+
+def test_execution_checks_still_run_and_are_still_reported():
+    """Excluded from confidence, not from the analysis."""
+    ctx = _context()
+    ctx.spread = 1.0
+    ctx.quality = _setup(stop_loss=99.9, take_profits=(100.1,))
+    result = _validate(ctx)
+
+    names = {c.name for c in result.checks}
+    for name in ve._EXECUTION_CHECKS:
+        assert name in names, f"{name} stopped running"
+    reported = {c.name for c in result.weaknesses} | {c.name for c in result.strengths}
+    assert ve._EXECUTION_CHECKS & reported, "no execution finding reached the report"
+
+
+def test_the_execution_set_is_exactly_the_checks_that_read_the_trade():
+    """Guards the classification rule itself: a check belongs to the
+    execution set iff it reads the trade's own parameters or the cost of
+    transacting. Verified by mutating each and watching what moves."""
+    baseline = _validate(_context())
+
+    # Mutating ONLY trade parameters must leave confidence untouched.
+    trade_only = _context()
+    trade_only.quality = _setup(stop_loss=99.0, take_profits=(101.0,))
+    trade_only.spread = 1.0
+    assert _validate(trade_only).adjustment == baseline.adjustment
+
+    # Mutating market evidence must move it.
+    market = _context()
+    market.smc = _smc(liquidity_sweeps=(_sweep_bullish(),))
+    assert _validate(market).adjustment != baseline.adjustment
+
+
+def test_every_execution_check_is_a_known_weight():
+    assert ve._EXECUTION_CHECKS <= set(ve._WEIGHTS)
+
+
+def test_directional_checks_are_the_majority_of_the_evidence():
+    """Confidence must still rest on a broad base after the exclusion."""
+    directional = {n: w for n, w in ve._WEIGHTS.items() if n not in ve._EXECUTION_CHECKS}
+    assert len(directional) == len(ve._WEIGHTS) - len(ve._EXECUTION_CHECKS)
+    assert sum(directional.values()) > sum(ve._WEIGHTS.values()) / 2

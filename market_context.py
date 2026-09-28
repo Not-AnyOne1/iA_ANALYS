@@ -109,7 +109,10 @@ class MarketContext:
     session: Optional[SessionInfo] = None
     news: Optional[NewsStatus] = None
 
-    # The stated setup, judged
+    # The stated setup, judged. ``setup`` is the parsed signal itself, kept
+    # so renderers can show the trader-facing levels (direction, stop, every
+    # take-profit) — ``quality`` judges them but only summarises one target.
+    setup: Optional[TradeSetup] = None
     quality: Optional[trade_quality.TradeQuality] = None
     risk: Optional[RiskAssessment] = None
 
@@ -196,6 +199,7 @@ class MarketContextBuilder:
         primary_series = series_by_tf.get(self._primary)
         if primary_series is not None:
             ctx.primary_candles = primary_series.candles
+        ctx.setup = setup
         if setup is not None:
             self._add_quality_and_risk(ctx, setup)
         self._add_validation(ctx, setup)

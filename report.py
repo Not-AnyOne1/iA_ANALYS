@@ -1,14 +1,18 @@
-"""Human-readable report for a market-validated signal.
+"""Human-readable reports for a market-validated signal.
 
 Pure formatting: a :class:`market_context.MarketContext` plus an optional
 :class:`trade_decision.TradeDecision` in, text out. No I/O, no computation —
 every number shown was produced by a deterministic engine upstream.
 
-Two renderings of the same facts:
+Two audiences, two renderings — deliberately different, not two views of the
+same text:
 
-- :func:`render_text` — the full desk report, for the terminal and logs.
-- :func:`render_telegram` — a compact HTML version for the bot, escaped and
-  length-capped for Telegram's 4096-character limit.
+- :func:`render_text` — the full desk report, for the terminal and the logs.
+  Every section, every number, monospace tables.
+- :func:`render_telegram_report` — a short card for the phone: instrument,
+  side, verdict, confidence, levels, and a few lines of why. At most 20
+  lines. It is not a trimmed copy of the desk report; a wall of tables is
+  unreadable on mobile and burying the verdict in it helps nobody.
 
 Missing values print as ``—`` rather than being omitted or defaulted, so a
 gap in the data is visible in the report instead of looking like it was
@@ -31,28 +35,25 @@ from trade_decision import (
 _DASH = "—"
 _TELEGRAM_LIMIT = 3800   # headroom under Telegram's 4096 cap
 
-# Budget for the *inner* text of a <pre> block, after HTML escaping and after
-# the wrapper tags. Telegram's hard cap is 4096 characters per message.
-_TELEGRAM_PRE_BUDGET = 3900
-
-# Sections that may be dropped, in the order they are sacrificed, when the
-# full report will not fit in one Telegram message. Market-data detail goes
-# first; the review itself (VALIDATION and the DECISION block) is never
-# dropped, because that is the part a trader actually acts on.
-_DROPPABLE_SECTIONS = (
-    "INDICATORS",
-    "SMART MONEY",
-    "LEVELS",
-    "SCORING & RISK",
-    "STRUCTURE",
-    "SETUP QUALITY",
-    "PRICE",
-    "CONTEXT",
-)
 
 
 def _num(value: Optional[float], digits: int = 2) -> str:
     return _DASH if value is None else f"{value:,.{digits}f}"
+
+
+def _price(value: Optional[float]) -> str:
+    """A price the way a trader writes it: 4100, not 4,100.00.
+
+    Separate from :func:`_num` because the terminal report's columns want
+    fixed width and grouping; a phone card wants the shortest exact form.
+    Precision follows magnitude, so 4100 stays 4100 and 1.23456 keeps its
+    pip. Trailing zeros are dropped, never significant digits.
+    """
+    if value is None:
+        return _DASH
+    magnitude = abs(value)
+    digits = 2 if magnitude >= 100 else 5 if magnitude >= 1 else 8
+    return f"{value:.{digits}f}".rstrip("0").rstrip(".") or "0"
 
 
 def _pct(value: Optional[float], digits: int = 1) -> str:
@@ -409,100 +410,102 @@ def render_telegram(context: MarketContext, decision: Optional[TradeDecision] = 
 
 # ------------------------------------------------------- full report for Telegram
 
-def _split_sections(text: str) -> tuple[list[str], list[tuple[str, list[str]]], list[str]]:
-    """Split a rendered report into (header, [(section, lines)], decision_block).
+def _card_line(text: str, limit: int = 110) -> str:
+    """One summary bullet: single line, escaped, hard length cap."""
+    flat = " ".join(str(text).split())
+    if len(flat) > limit:
+        flat = flat[:limit - 1].rstrip(" ,;:.") + "…"
+    return html.escape(flat)
 
-    The decision block is everything from the rule line that precedes
-    ``DECISION`` to the end of the report, kept whole so the verdict,
-    self-critique and scenarios can never be split apart.
+
+def _summary_bullets(context: MarketContext,
+                     decision: Optional[TradeDecision]) -> list[str]:
+    """2-4 short bullets saying WHY, not what every indicator did.
+
+    Drawn from what the pipeline already produced — the strongest confluence
+    first, then the decision's own reason, then the single biggest risk. No
+    new analysis and nothing asked of Claude that it was not already asked.
     """
-    lines = text.split("\n")
+    bullets: list[str] = []
+    if decision is not None:
+        strengths = [s for s in decision.strengths if s.strip()]
 
-    decision_at = next(
-        (i for i, line in enumerate(lines) if line.startswith("DECISION  ")), None
-    )
-    if decision_at is not None and decision_at > 0 and set(lines[decision_at - 1]) == {"="}:
-        decision_at -= 1                      # include the opening rule
-    body_end = decision_at if decision_at is not None else len(lines)
-    decision_block = lines[body_end:] if decision_at is not None else []
+        # On a refusal the reason IS the message — a trader needs to know
+        # what stopped it, not what was good about it. Otherwise lead with
+        # the confluence that carried the trade.
+        if decision.verdict is Action.SKIP and decision.decision_reason:
+            bullets.append(_card_line(decision.decision_reason))
+            bullets.extend(_card_line(s) for s in strengths[:1])
+        else:
+            bullets.extend(_card_line(s) for s in strengths[:2])
+            if len(bullets) < 2 and decision.decision_reason:
+                bullets.append(_card_line(decision.decision_reason))
 
-    # The header is the opening rule, title, timestamp and closing rule.
-    header_end = 0
-    rules_seen = 0
-    for i, line in enumerate(lines[:body_end]):
-        if line and set(line) == {"="}:
-            rules_seen += 1
-            if rules_seen == 2:
-                header_end = i + 1
-                break
-    header = lines[:header_end]
+        # The biggest risk, stated once. The self-critique is the sharpest
+        # version of it; fall back to the first listed risk.
+        risk = decision.strongest_reason_against or (
+            decision.risks[0] if decision.risks else "")
+        if risk.strip():
+            bullets.append("⚠ " + _card_line(risk))
 
-    sections: list[tuple[str, list[str]]] = []
-    current_name: str | None = None
-    current: list[str] = []
-    for line in lines[header_end:body_end]:
-        # A section heading is an unindented all-caps line.
-        if line and not line.startswith(" ") and line == line.upper() and set(line) != {"="}:
-            if current_name is not None:
-                sections.append((current_name, current))
-            current_name, current = line, [line]
-        elif current_name is not None:
-            current.append(line)
-    if current_name is not None:
-        sections.append((current_name, current))
-
-    return header, sections, decision_block
+    if not bullets:
+        v = context.validation
+        if v is not None and v.strengths:
+            bullets.append(_card_line(v.strengths[0].detail))
+        if v is not None and v.weaknesses:
+            bullets.append("⚠ " + _card_line(v.weaknesses[0].detail))
+    if not bullets:
+        bullets.append(_card_line("No qualitative review was available for this signal."))
+    return bullets[:4]
 
 
 def render_telegram_report(
     context: MarketContext, decision: Optional[TradeDecision] = None
 ) -> str:
-    """The final report as one Telegram HTML message.
+    """The final Telegram message: a short card, readable on a phone.
 
-    Wrapped in ``<pre>`` so the monospace alignment of the terminal report is
-    preserved exactly — the Telegram message reads the same as the terminal
-    output, same sections and same numbers, rather than being a separate
-    summary that could drift out of step with it.
+    Deliberately NOT the terminal report. That runs to thousands of
+    characters of tables and is unreadable on mobile; it stays in the
+    terminal and the logs. This is only what a trader needs before acting —
+    instrument, side, verdict, confidence, levels, and a few lines of why.
 
-    Telegram caps a message at 4096 characters and a full report runs to
-    roughly 5000, so the whole thing does not always fit. When it does not,
-    market-data detail sections are dropped (in ``_DROPPABLE_SECTIONS``
-    order) and an explicit note names what was omitted. The header, the
-    ``VALIDATION`` section and the whole ``DECISION`` block — verdict,
-    confidence, fatal problems, strengths, weaknesses, self-critique,
-    alternative/worst/best case, reasoning and plan — are never dropped.
+    At most 20 lines by construction: 8 fixed, up to 5 take-profits, up to 4
+    summary bullets.
     """
-    full = render_text(context, decision)
-    if len(html.escape(full)) <= _TELEGRAM_PRE_BUDGET:
-        return f"<pre>{html.escape(full)}</pre>"
+    setup = context.setup
+    esc = html.escape
 
-    header, sections, decision_block = _split_sections(full)
-    kept = {name for name, _ in sections}
-    omitted: list[str] = []
+    direction = getattr(setup, "direction", None)
+    side = {"long": "BUY", "short": "SELL"}.get(direction, "—")
+    symbol = esc(context.symbol or "?")
 
-    def assemble(active: set[str]) -> str:
-        parts = list(header)
-        for name, body in sections:
-            if name in active:
-                parts.extend(body)
-        parts.extend(decision_block)
-        if omitted:
-            parts.append("")
-            parts.append(f"[omitted to fit Telegram's message limit: "
-                         f"{', '.join(omitted)} — see the terminal report]")
-        return "\n".join(parts)
+    lines = ["━" * 22, f"📊 <b>{symbol} — {side}</b>", ""]
 
-    for candidate in _DROPPABLE_SECTIONS:
-        if len(html.escape(assemble(kept))) <= _TELEGRAM_PRE_BUDGET:
-            break
-        if candidate in kept:
-            kept.discard(candidate)
-            omitted.append(candidate)
+    if decision is not None:
+        mark = {Action.ENTER: "✅", Action.WAIT: "⏸",
+                Action.SKIP: "⛔"}[decision.verdict]
+        lines.append(f"{mark} <b>Decision:</b> {decision.verdict.value.upper()}")
+        lines.append(f"🎯 <b>Confidence:</b> {decision.confidence}%")
+    else:
+        lines.append("⛔ <b>Decision:</b> —")
+    lines.append("")
 
-    body = assemble(kept)
-    escaped = html.escape(body)
-    if len(escaped) > _TELEGRAM_PRE_BUDGET:
-        # Even the protected core is too long (a pathological reasoning
-        # string). Trim from the end and say so rather than sending nothing.
-        escaped = escaped[:_TELEGRAM_PRE_BUDGET] + "\n[... truncated]"
-    return f"<pre>{escaped}</pre>"
+    entry = getattr(context.quality, "entry_price", None)
+    if entry is None and setup is not None and setup.entries:
+        entry = setup.entries[0]
+    if entry is not None:
+        lines.append(f"💰 <b>Entry:</b> {_price(entry)}")
+    stop = getattr(setup, "stop_loss", None)
+    if stop is not None:
+        lines.append(f"🛑 <b>SL:</b> {_price(stop)}")
+    for i, tp in enumerate(list(getattr(setup, "take_profits", None) or [])[:5], 1):
+        lines.append(f"🎯 <b>TP{i}:</b> {_price(tp)}")
+
+    lines.append("")
+    lines.append("📌 <b>Summary:</b>")
+    lines.extend(f"• {b}" for b in _summary_bullets(context, decision))
+
+    message = "\n".join(lines)
+    if len(message) > _TELEGRAM_LIMIT:      # unreachable in practice; never send nothing
+        message = message[:_TELEGRAM_LIMIT - 1] + "…"
+    return message

@@ -156,10 +156,14 @@ def test_disabled_without_token(monkeypatch):
     assert BotSettings.from_env().enabled is False
 
 
-def test_disabled_without_chat_id(monkeypatch):
+def test_enabled_with_only_a_token(monkeypatch):
+    """A target chat is no longer required: the audience is built at runtime
+    from /start, so a token alone is enough to run."""
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "abc")
     monkeypatch.delenv("TELEGRAM_BOT_CHAT_ID", raising=False)
-    assert BotSettings.from_env().enabled is False
+    settings = BotSettings.from_env()
+    assert settings.enabled is True
+    assert settings.chat_id is None
 
 
 def test_enabled_with_numeric_chat_id(monkeypatch):
@@ -351,9 +355,11 @@ def test_overly_long_message_is_truncated():
 
 # --------------------------------------------------------------------------- commands
 
-def _update(chat_id: int = 12345, username: str | None = None) -> MagicMock:
+def _update(chat_id: int = 12345, username: str | None = None,
+            chat_type: str = "private") -> MagicMock:
     update = MagicMock()
-    update.effective_chat = MagicMock(id=chat_id, username=username)
+    update.effective_chat = MagicMock(id=chat_id, username=username,
+                                  type=chat_type, first_name=None)
     update.message = MagicMock()
     update.message.reply_text = AsyncMock()
     return update
@@ -372,24 +378,49 @@ def test_start_command_replies_for_authorized_chat():
     update.message.reply_text.assert_awaited_once()
 
 
-def test_unauthorized_chat_is_ignored():
+def test_informational_commands_ignore_a_non_subscriber():
+    """/status and /history still reveal pipeline internals, so they stay
+    behind a check — membership now, rather than one hard-coded chat."""
     bot = _bot_with_mock_client()
-    update = _update(chat_id=99999)  # different from settings.chat_id=12345
+    update = _update(chat_id=99999)  # not subscribed, not settings.chat_id
 
-    asyncio.run(bot._cmd_start(update, _context()))
     asyncio.run(bot._cmd_status(update, _context()))
     asyncio.run(bot._cmd_history(update, _context()))
 
     update.message.reply_text.assert_not_awaited()
 
 
-def test_username_based_authorization():
+def test_start_is_open_to_anyone():
+    """Subscribing cannot require being subscribed."""
+    bot = _bot_with_mock_client()
+    update = _update(chat_id=99999)
+
+    asyncio.run(bot._cmd_start(update, _context()))
+
+    update.message.reply_text.assert_awaited_once()
+    assert 99999 in bot._subscribers
+
+
+def test_subscribing_unlocks_the_informational_commands():
+    bot = _bot_with_mock_client()
+    update = _update(chat_id=99999)
+
+    asyncio.run(bot._cmd_status(update, _context()))
+    assert update.message.reply_text.await_count == 0
+
+    asyncio.run(bot._cmd_start(update, _context()))
+    asyncio.run(bot._cmd_status(update, _context()))
+    assert update.message.reply_text.await_count == 2
+
+
+def test_username_based_authorization_still_works_for_the_legacy_chat():
+    """The configured @channel keeps its access without subscribing."""
     bot = TelegramBot(_settings(chat_id="@mychannel"))
     authorized = _update(chat_id=555, username="mychannel")
     unauthorized = _update(chat_id=555, username="someoneelse")
 
-    asyncio.run(bot._cmd_start(authorized, _context()))
-    asyncio.run(bot._cmd_start(unauthorized, _context()))
+    asyncio.run(bot._cmd_status(authorized, _context()))
+    asyncio.run(bot._cmd_status(unauthorized, _context()))
 
     assert authorized.message.reply_text.await_count == 1
     assert unauthorized.message.reply_text.await_count == 0
@@ -607,3 +638,100 @@ def test_price_command_reports_market_data_error():
     text = update.message.reply_text.await_args.args[0]
     assert "unavailable" in text
     assert "NOTREAL" in text
+
+
+# ------------------------------------------------------ dynamic subscribers
+
+def _bot_with_storage(tmp_path, **overrides):
+    from storage import Storage
+    bot = _bot_with_mock_client(**overrides)
+    storage = Storage(tmp_path / "subs.db")
+    asyncio.run(storage.initialize())
+    bot.attach_storage(storage)
+    return bot, storage
+
+
+def test_start_registers_and_stop_unregisters(tmp_path):
+    bot, storage = _bot_with_storage(tmp_path)
+    update = _update(chat_id=555, username="alice")
+
+    asyncio.run(bot._cmd_start(update, _context()))
+    assert bot._subscribers == {555}
+    assert asyncio.run(storage.subscribers()) == [555]
+
+    asyncio.run(bot._cmd_stop(update, _context()))
+    assert bot._subscribers == set()
+    assert asyncio.run(storage.subscribers()) == []
+
+
+def test_start_is_idempotent(tmp_path):
+    bot, storage = _bot_with_storage(tmp_path)
+    update = _update(chat_id=555)
+
+    asyncio.run(bot._cmd_start(update, _context()))
+    asyncio.run(bot._cmd_start(update, _context()))
+
+    assert asyncio.run(storage.subscribers()) == [555]
+    assert "already subscribed" in update.message.reply_text.await_args_list[-1].args[0].lower()
+
+
+def test_subscribers_survive_a_restart(tmp_path):
+    bot, storage = _bot_with_storage(tmp_path)
+    asyncio.run(bot._cmd_start(_update(chat_id=111), _context()))
+    asyncio.run(bot._cmd_start(_update(chat_id=222), _context()))
+
+    fresh = _bot_with_mock_client()          # a new process
+    fresh.attach_storage(storage)
+    assert fresh._subscribers == set()
+    asyncio.run(fresh._load_subscribers())
+    assert fresh._subscribers == {111, 222}
+
+
+def test_start_in_a_group_does_not_subscribe(tmp_path):
+    """Registering a group would broadcast every report to all its members."""
+    bot, storage = _bot_with_storage(tmp_path)
+    update = _update(chat_id=-100999, chat_type="supergroup")
+
+    asyncio.run(bot._cmd_start(update, _context()))
+
+    assert bot._subscribers == set()
+    assert asyncio.run(storage.subscribers()) == []
+    assert "private chat" in update.message.reply_text.await_args.args[0]
+
+
+def test_stop_when_not_subscribed_is_harmless(tmp_path):
+    bot, _ = _bot_with_storage(tmp_path)
+    update = _update(chat_id=555)
+
+    asyncio.run(bot._cmd_stop(update, _context()))
+
+    assert bot._subscribers == set()
+    assert "not subscribed" in update.message.reply_text.await_args.args[0].lower()
+
+
+def test_subscribing_works_without_storage():
+    """Persistence is unavailable, but the bot must still function."""
+    bot = _bot_with_mock_client()
+    assert bot._storage is None
+
+    asyncio.run(bot._cmd_start(_update(chat_id=555), _context()))
+    assert bot._subscribers == {555}
+
+
+def test_destinations_prefer_subscribers_over_the_configured_chat():
+    bot = _bot_with_mock_client(chat_id=12345)
+    assert bot._destinations() == [12345]         # fallback while empty
+    bot._subscribers = {777, 888}
+    assert bot._destinations() == [777, 888]      # subscribers take over
+
+
+def test_destinations_are_empty_without_subscribers_or_fallback():
+    assert _bot_with_mock_client(chat_id=None)._destinations() == []
+
+
+def test_help_lists_start_and_stop():
+    bot = _bot_with_mock_client()
+    update = _update(chat_id=12345)
+    asyncio.run(bot._cmd_help(update, _context()))
+    text = update.message.reply_text.await_args.args[0]
+    assert "/start" in text and "/stop" in text

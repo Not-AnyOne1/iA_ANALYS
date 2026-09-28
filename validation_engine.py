@@ -99,8 +99,9 @@ class ValidationResult:
     a single opaque delta.
     """
 
-    bonus: int                          # 0..MAX_ADJUSTMENT, earned by strengths
-    penalty: int                        # 0..MAX_ADJUSTMENT, charged by weaknesses
+    bonus: int      # 0..MAX_ADJUSTMENT — additive credit earned by strengths
+    penalty: int    # 0..deterministic — charge proportional to the score, so a
+                    # review can actually overturn a strong reading
     checks: Tuple[ValidationCheck, ...]
 
     @property
@@ -138,12 +139,27 @@ class ValidationResult:
                 f"{len(self.unknowns)} unverified")
 
 
-# The most confidence the review may add, and separately the most it may
-# take away. Chosen so a review can carry a setup across one decision band
-# (the bands are 20 points wide) but never across both: market conviction
-# from the scoring engine remains the base, and this remains an adjustment
-# to it. Surfaced in the report so it is never a hidden constant.
+# The most confidence the review may ADD. Bounded so a review can carry a
+# setup across one decision band (the bands are 20 points wide) but never
+# manufacture conviction it did not measure — that stays the scoring
+# engine's job. Surfaced in the report, never hidden.
 MAX_ADJUSTMENT = 25
+
+# The most the review may TAKE AWAY, reached only at total contradiction
+# (every possible check fired, all of them against). Derived from the
+# decision bands rather than chosen:
+#
+#   100 - 40 = 60   the bare minimum, so that TOTAL contradiction can carry
+#                   the highest attainable confidence below the SKIP
+#                   threshold instead of stalling in WAIT
+#   +      20       one band width of margin, so that *overwhelming*
+#                   contradiction — not only the unreachable total — can do
+#                   it too
+#
+# Larger than MAX_ADJUSTMENT because a brake should out-pull an accelerator.
+# Because the curve is quadratic, this ceiling is approached only at the
+# extreme: ordinary disagreement costs a few points, not tens.
+MAX_PENALTY = 80
 
 
 # Per-check weights. Higher weight = more influence on the score. Structural
@@ -170,6 +186,32 @@ _WEIGHTS = {
     "max_adverse_excursion": 9.0,
     "probability_score": 8.0,
 }
+
+
+# Checks that describe the TRADE rather than the MARKET.
+#
+# Confidence answers one question — how likely is price to move the way we
+# predicted — so only evidence about the market may move it. Whether the
+# stop is well placed, whether the payoff is worth taking, and what the
+# spread costs are all real findings, but they say nothing about direction:
+# a 1:3 payoff does not make a weak read more likely to be right, and a
+# tight stop does not make a strong read less likely to be right.
+#
+# The rule for membership is objective and mechanically testable: a check
+# belongs here if it reads the trade's own parameters (entry, stop, targets)
+# or the cost of transacting. Everything else reads the market and is
+# therefore directional.
+#
+# These checks still RUN, still appear in the report as strengths and
+# weaknesses, and are still sent to Claude. They are excluded from the
+# confidence adjustment only. Their power over the outcome is exercised
+# where it belongs — through ``risk_engine``, which owns approval, and
+# through the verdict bands.
+_EXECUTION_CHECKS = frozenset({
+    "risk_reward",             # reads entry, stop and target
+    "max_adverse_excursion",   # reads the stop's ATR multiple
+    "spread",                  # the cost of transacting
+})
 
 
 def _check(name: str, severity: Severity, detail: str, ratio: float = 1.0) -> ValidationCheck:
@@ -664,31 +706,78 @@ class ValidationEngine:
     def _adjustments(checks: Sequence[ValidationCheck]) -> Tuple[int, int]:
         """Turn the checks into confidence points to add and to subtract.
 
-        Each side is expressed as a share of the *total possible* weight and
-        scaled by :data:`MAX_ADJUSTMENT`::
+        Only the DIRECTIONAL checks are read. Confidence means one thing —
+        how likely price is to move the way we predicted — so the checks in
+        :data:`_EXECUTION_CHECKS`, which describe the trade rather than the
+        market, are filtered out first. A perfect payoff cannot make a weak
+        read more likely to be right, and a tight stop cannot make a strong
+        read less likely to be right; both change whether the trade is worth
+        taking, which is the risk engine's question and the verdict's, not
+        this number's.
 
-            bonus   = MAX_ADJUSTMENT * (sum of positive contributions) / total
-            penalty = MAX_ADJUSTMENT * (sum of negative contributions) / total
+        Let ``P`` and ``N`` be the summed positive and negative contributions
+        of the directional checks, ``T`` their total possible weight, and
+        ``C = P + N`` the weight that actually voted.
 
-        Two properties follow from the fixed denominator, and both are
-        deliberate:
+        **Bonus — additive, bounded, unchanged.** ``MAX_ADJUSTMENT * P / T``.
+        A check whose data was unavailable contributes nothing to the
+        numerator while still counting in the denominator, so it cannot earn
+        bonus: a setup nobody could verify gets almost no credit.
 
-        * **Skepticism survives.** A check whose data was unavailable
-          contributes nothing to the numerator while still counting in the
-          denominator, so it cannot earn bonus. A setup nobody could verify
-          gets almost no credit — it is not quietly treated as fine.
-        * **The review can never dominate.** Bonus and penalty are each
-          bounded by MAX_ADJUSTMENT, so the review can move a verdict across
-          a band but never manufacture one on its own. Market conviction, the
-          deterministic score, stays the base.
+        **Penalty — a fixed points budget, quadratic in opposition.**
+
+            contradiction = (N / T) * (N / C)
+            penalty       = MAX_PENALTY * contradiction
+
+        The penalty depends on the validation evidence and on nothing else.
+        It is deliberately NOT proportional to the deterministic score: a
+        review is a brake on the decision, not a second opinion about how
+        strong the setup is. Scaling it by the score made the brake bite
+        hardest exactly where conviction was highest, which is backwards —
+        a strong reading should be able to carry moderate opposition.
+
+        ``contradiction`` is the parameter-free measure of how contradicted
+        the setup is. Its two factors answer different questions, and *both*
+        must be high before the penalty bites:
+
+        * ``N / T`` — how much contradictory evidence exists at all, against
+          everything that could possibly have spoken. One small check firing
+          alone gives a small number however lopsided the vote looks.
+        * ``N / C`` — what share of the evidence that *did* speak was
+          contradictory. Opposition that is outweighed by support is
+          discounted in exact proportion.
+
+        Their product ``N^2 / (T*C)`` is smooth everywhere, zero when nothing
+        contradicts, and one only when every possible check fired and all of
+        them fired against. Being quadratic in the opposition share is what
+        gives the required curve: a little disagreement costs almost nothing,
+        and the marginal cost rises the more contradicted the setup already
+        is. It is strictly increasing in ``N`` and strictly decreasing in
+        ``P``, so more contradictory evidence can never raise confidence and
+        more support can never lower it.
+
+        The asymmetry between :data:`MAX_ADJUSTMENT` and :data:`MAX_PENALTY`
+        is deliberate: a review may add only modest confidence, because
+        reviewing is not a source of market conviction, but it may remove
+        more, because challenging the trade is what it is for.
 
         No clamping happens here; the single clamp is applied once in
         ``trade_decision`` after the arithmetic.
         """
-        total = sum(c.weight for c in checks)
-        if total == 0:
+        # Directional evidence only. Trade-management findings are excluded
+        # here and nowhere else: they still run, still appear in the report,
+        # and still reach Claude and the risk engine.
+        directional = [c for c in checks if c.name not in _EXECUTION_CHECKS]
+
+        total = sum(c.weight for c in directional)
+        if total <= 0:
             return 0, 0
-        positive = sum(c.contribution for c in checks if c.contribution > 0)
-        negative = -sum(c.contribution for c in checks if c.contribution < 0)
-        return (round(MAX_ADJUSTMENT * positive / total),
-                round(MAX_ADJUSTMENT * negative / total))
+        positive = sum(c.contribution for c in directional if c.contribution > 0)
+        negative = -sum(c.contribution for c in directional if c.contribution < 0)
+        bonus = round(MAX_ADJUSTMENT * positive / total)
+
+        cast = positive + negative
+        if cast <= 0:
+            return bonus, 0          # nothing voted: nothing to contradict
+        contradiction = (negative / total) * (negative / cast)
+        return bonus, round(MAX_PENALTY * contradiction)

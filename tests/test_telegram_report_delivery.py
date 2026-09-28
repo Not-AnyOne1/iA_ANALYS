@@ -127,10 +127,12 @@ def _msg(message_id: int = 4242) -> IncomingMessage:
                            text="BUY GOLD NOW\nTP:280\nSL:240")
 
 
-def _run(tmp_path, *, send_effect=None, message=None, emit_reports=False):
+def _run(tmp_path, *, send_effect=None, message=None, emit_reports=False,
+         bot_chat_id=12345, subscribers=()):
     """Run one message through the real pipeline; return (bot, stats, sends)."""
     settings = _settings(tmp_path)
-    bot = TelegramBot(BotSettings(bot_token="t", chat_id=12345))
+    bot = TelegramBot(BotSettings(bot_token="t", chat_id=bot_chat_id))
+    bot._subscribers = set(subscribers)
     if send_effect is not None:
         bot._bot.send_message = AsyncMock(side_effect=send_effect)
 
@@ -195,51 +197,49 @@ def test_reprocessing_the_same_signal_sends_nothing_further(tmp_path):
 
 # ----------------------------------------------------------- it is the final report
 
-def test_the_message_is_the_final_report(tmp_path):
+def test_the_message_is_a_short_card_not_the_long_report(tmp_path):
+    """The terminal report is thousands of characters of tables and is
+    unreadable on a phone. It stays in the terminal; Telegram gets a card."""
     _, _, sends = _run(tmp_path)
     text = _sent_text(sends[0])
 
-    assert "MARKET REPORT" in text
-    # Claude asked for "wait"; the synthetic series validates below the 40
-    # threshold, so the band caps the delivered verdict at SKIP.
-    assert "DECISION  SKIP" in text
-    assert "VALIDATION" in text
+    assert "📊" in text and "XAUUSD" in text
+    assert "Decision:" in text
+    assert "Confidence:" in text
+    assert "Summary:" in text
+
+    for long_report_marker in ("MARKET REPORT", "INDICATORS", "SMART MONEY",
+                               "LEVELS", "STRUCTURE", "VALIDATION",
+                               "Bands", "deterministic score"):
+        assert long_report_marker not in text, f"{long_report_marker!r} leaked into the card"
 
 
-def test_the_message_contains_every_required_review_element(tmp_path):
+def test_the_card_is_at_most_twenty_lines(tmp_path):
+    _, _, sends = _run(tmp_path)
+    lines = _sent_text(sends[0]).splitlines()
+    assert len(lines) <= 20, f"{len(lines)} lines:\n" + "\n".join(lines)
+
+
+def test_the_card_carries_the_levels_a_trader_needs(tmp_path):
     _, _, sends = _run(tmp_path)
     text = _sent_text(sends[0])
-
-    for element in ("Review adjustment", "Strengths", "Weaknesses",
-                    "Strongest reason NOT to take this trade",
-                    "Alternative scenario", "Worst case", "Best case",
-                    "deterministic score", "validation bonus",
-                    "validation penalty", "adjusted score", "Bands"):
-        assert element in text, f"{element!r} missing from the Telegram report"
+    assert "Entry:" in text
+    assert "SL:" in text
+    assert "TP1:" in text
 
 
-def test_the_message_matches_the_terminal_report(tmp_path):
-    """Same renderer, same content — the two cannot drift apart."""
-    _, _, sends = _run(tmp_path)
-    sent = _sent_text(sends[0])
-
-    builder = MarketContextBuilder(MarketDataService(_Provider()),
-                                   risk_settings=RiskSettings(min_confidence=0))
-    ctx = asyncio.run(builder.build("XAUUSD", _analysis().setup))
-    terminal = report_mod.render_text(ctx)
-
-    # Compare the section headings actually delivered against the terminal's.
-    for heading in ("PRICE", "STRUCTURE", "CONTEXT", "VALIDATION"):
-        if heading in terminal:
-            assert heading in sent, f"section {heading} missing from Telegram"
+def test_the_card_has_no_json_and_no_raw_lists(tmp_path):
+    text = _sent_text(_run(tmp_path)[2][0])
+    for banned in ("{", "}", "[", "]", "severity", "contribution", "weight="):
+        assert banned not in text, f"{banned!r} leaked into the card"
 
 
 def test_the_message_uses_telegram_html(tmp_path):
     _, _, sends = _run(tmp_path)
     call = sends[0]
     assert call.kwargs["parse_mode"] == "HTML"
-    assert call.kwargs["text"].startswith("<pre>")
-    assert call.kwargs["text"].endswith("</pre>")
+    assert "<b>" in call.kwargs["text"]
+    assert "<pre>" not in call.kwargs["text"]   # no monospace dump any more
 
 
 def test_the_message_fits_telegram_limit(tmp_path):
@@ -270,7 +270,7 @@ def test_nothing_is_sent_before_the_report(tmp_path):
     intermediate message preceded it."""
     _, _, sends = _run(tmp_path)
     assert len(sends) == 1
-    assert "DECISION" in _sent_text(sends[0])
+    assert "Decision:" in _sent_text(sends[0])
 
 
 def test_no_message_at_all_when_market_validation_is_disabled(tmp_path):
@@ -294,9 +294,18 @@ def test_no_message_at_all_when_market_validation_is_disabled(tmp_path):
 
 # ------------------------------------------------------------------- replying
 
-def test_the_report_replies_to_the_original_signal(tmp_path):
-    _, _, sends = _run(tmp_path, message=_msg(4242))
+def test_the_report_replies_when_the_destination_is_the_source_chat(tmp_path):
+    """A reply only means anything in the chat the signal came from."""
+    _, _, sends = _run(tmp_path, message=_msg(4242), bot_chat_id=-100999)
     assert sends[0].kwargs.get("reply_to_message_id") == 4242
+
+
+def test_no_reply_is_attempted_for_a_subscriber(tmp_path):
+    """A subscriber's private chat does not contain the group's message, so
+    attempting a reply would be a guaranteed rejection."""
+    _, _, sends = _run(tmp_path, message=_msg(4242), subscribers=(777,))
+    assert sends[0].kwargs["chat_id"] == 777
+    assert "reply_to_message_id" not in sends[0].kwargs
 
 
 def test_falls_back_to_a_normal_message_when_the_reply_target_is_missing(tmp_path):
@@ -310,7 +319,7 @@ def test_falls_back_to_a_normal_message_when_the_reply_target_is_missing(tmp_pat
             raise BadRequest("Replied message not found")
         return None
 
-    bot, _, sends = _run(tmp_path, send_effect=effect)
+    bot, _, sends = _run(tmp_path, send_effect=effect, bot_chat_id=-100999)
 
     assert calls["n"] == 2                                   # reply attempt, then plain
     assert "reply_to_message_id" not in sends[-1].kwargs      # the retry had no reply
@@ -377,54 +386,142 @@ def test_terminal_output_is_unaffected_by_telegram(tmp_path, capsys):
 
 # --------------------------------------------------------- renderer-level guarantees
 
-def test_renderer_never_drops_the_decision_block():
-    """Long reports are trimmed, but never at the expense of the verdict."""
-    from trade_decision import Action, TradeDecision
+def _long_decision(verdict, **over):
+    from trade_decision import TradeDecision
     from decision_engine import DecisionSource
-
-    builder = MarketContextBuilder(MarketDataService(_Provider()),
-                                   risk_settings=RiskSettings(min_confidence=0))
-    ctx = asyncio.run(builder.build("XAUUSD", _analysis().setup))
-    decision = TradeDecision(
-        symbol="XAUUSD", verdict=Action.SKIP, confidence=0,
+    base = dict(
+        symbol="XAUUSD", verdict=verdict, confidence=0,
         reasoning="R" * 400, strengths=["S" * 100] * 5, risks=["W" * 100] * 5,
         strongest_reason_against="A" * 300, alternative_scenario="B" * 300,
         worst_case="C" * 300, best_case="D" * 300, execution_plan="E" * 200,
-        source=DecisionSource.CLAUDE, validation_score=0,
-        fatal_problems=["F" * 200])
-
-    out = report_mod.render_telegram_report(ctx, decision)
-    text = html.unescape(out)
-
-    assert len(out) <= 4096
-    assert "DECISION  SKIP" in text
-    assert "Strongest reason NOT to take this trade" in text
+        source=DecisionSource.CLAUDE, fatal_problems=["F" * 200],
+        decision_reason="Z" * 300)
+    base.update(over)
+    return TradeDecision(**base)
 
 
-def test_renderer_notes_what_it_omitted():
-    from trade_decision import Action, TradeDecision
-    from decision_engine import DecisionSource
-
+def _built_context():
     builder = MarketContextBuilder(MarketDataService(_Provider()),
                                    risk_settings=RiskSettings(min_confidence=0))
-    ctx = asyncio.run(builder.build("XAUUSD", _analysis().setup))
-    decision = TradeDecision(
-        symbol="XAUUSD", verdict=Action.SKIP, confidence=0, reasoning="R" * 800,
-        strengths=["S" * 80] * 5, risks=["W" * 80] * 5,
-        strongest_reason_against="A" * 300, alternative_scenario="B" * 300,
-        worst_case="C" * 300, best_case="D" * 300, execution_plan="E" * 200,
-        source=DecisionSource.CLAUDE, validation_score=0, fatal_problems=[])
-
-    text = html.unescape(report_mod.render_telegram_report(ctx, decision))
-    if "omitted to fit" in text:
-        assert "see the terminal report" in text
+    return asyncio.run(builder.build("XAUUSD", _analysis().setup))
 
 
-def test_short_report_is_sent_verbatim():
-    """When it fits, the Telegram text is the terminal report unchanged."""
+def test_the_card_stays_short_even_with_pathological_model_output():
+    """Every narrative field maxed out must still produce a readable card."""
+    from trade_decision import Action
+
+    out = report_mod.render_telegram_report(_built_context(), _long_decision(Action.SKIP))
+    lines = out.splitlines()
+
+    assert len(out) <= 4096
+    assert len(lines) <= 20, f"{len(lines)} lines"
+    assert max(len(l) for l in lines) <= 160, "a bullet ran away"
+
+
+def test_a_refusal_leads_with_the_reason_it_was_refused():
+    """On SKIP the trader needs to know what stopped it, first."""
+    from trade_decision import Action
+
+    out = report_mod.render_telegram_report(
+        _built_context(),
+        _long_decision(Action.SKIP, decision_reason="risk engine rejected: spread too wide",
+                       strengths=["Structure is clean."]))
+    summary = out.split("Summary:")[1]
+    assert summary.index("risk engine rejected") < summary.index("Structure is clean")
+
+
+def test_an_entry_leads_with_the_confluence():
+    from trade_decision import Action
+
+    out = report_mod.render_telegram_report(
+        _built_context(),
+        _long_decision(Action.ENTER, confidence=72,
+                       strengths=["Bullish BOS aligns with the trade.",
+                                  "Risk/Reward is acceptable."],
+                       strongest_reason_against="Higher timeframes are mixed."))
+    summary = out.split("Summary:")[1]
+    assert summary.index("Bullish BOS") < summary.index("Higher timeframes are mixed")
+    assert "72%" in out
+
+
+def test_the_card_renders_without_a_decision():
+    """A context with no decision must still produce a valid message."""
     from market_context import MarketContext
 
     ctx = MarketContext(symbol="XAUUSD", generated_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
                         primary_timeframe=Timeframe.H1)
     out = report_mod.render_telegram_report(ctx)
-    assert html.unescape(out[len("<pre>"):-len("</pre>")]) == report_mod.render_text(ctx)
+    assert "XAUUSD" in out
+    assert len(out.splitlines()) <= 20
+
+
+def test_prices_are_written_the_way_a_trader_writes_them():
+    assert report_mod._price(4100.0) == "4100"
+    assert report_mod._price(4085.5) == "4085.5"
+    assert report_mod._price(1.08432) == "1.08432"
+    assert report_mod._price(0.00012345) == "0.00012345"
+    assert report_mod._price(None) == "—"
+
+
+# ------------------------------------------------------------- subscribers
+
+def test_every_subscriber_receives_the_report(tmp_path):
+    _, _, sends = _run(tmp_path, subscribers=(111, 222, 333))
+    assert sorted(c.kwargs["chat_id"] for c in sends) == [111, 222, 333]
+
+
+def test_subscribers_replace_the_configured_chat_as_the_destination(tmp_path):
+    """TELEGRAM_BOT_CHAT_ID is a fallback, not the primary target."""
+    _, _, sends = _run(tmp_path, bot_chat_id=12345, subscribers=(777,))
+    assert [c.kwargs["chat_id"] for c in sends] == [777]
+
+
+def test_the_configured_chat_is_used_when_nobody_has_subscribed(tmp_path):
+    """Backward compatibility: an existing deployment keeps working."""
+    _, _, sends = _run(tmp_path, bot_chat_id=12345, subscribers=())
+    assert [c.kwargs["chat_id"] for c in sends] == [12345]
+
+
+def test_nothing_is_sent_with_no_subscribers_and_no_fallback(tmp_path):
+    _, _, sends = _run(tmp_path, bot_chat_id=None, subscribers=())
+    assert sends == []
+
+
+def test_one_failing_subscriber_does_not_cost_the_others(tmp_path):
+    """A user who blocked the bot must not silence everyone else."""
+    def effect(*args, **kwargs):
+        if kwargs.get("chat_id") == 222:
+            raise BadRequest("bot was blocked by the user")
+        return None
+
+    bot, _, sends = _run(tmp_path, subscribers=(111, 222, 333), send_effect=effect)
+
+    assert sorted(c.kwargs["chat_id"] for c in sends) == [111, 222, 333]
+    assert bot._stats.notifications_failed == 1
+    assert bot._stats.notifications_sent == 1      # the signal was still delivered
+
+
+def test_the_report_is_still_deduplicated_across_all_subscribers(tmp_path):
+    """Three destinations is one report, not three chances to re-send."""
+    settings = _settings(tmp_path)
+    bot = TelegramBot(BotSettings(bot_token="t", chat_id=None))
+    bot._subscribers = {111, 222}
+    builder = MarketContextBuilder(MarketDataService(_Provider()),
+                                   risk_settings=RiskSettings(min_confidence=0))
+    engine = TradeDecisionEngine(settings)
+    engine._run_cli = AsyncMock(return_value=(0, _verdict_envelope(), ""))
+
+    async def go():
+        pipeline = AnalysisPipeline(
+            settings, asyncio.Queue(), _Analyzer(),
+            Formatter(color=False, show_json=False), bot=bot,
+            context_builder=builder, trade_decision_engine=engine,
+            emit_reports=False)
+        async with pipeline:
+            await pipeline._process(_msg(7))
+            await pipeline._process(_msg(7))
+
+    asyncio.run(go())
+
+    assert bot._bot.send_message.await_count == 2      # two subscribers, once each
+    assert bot._stats.duplicates_skipped == 1
