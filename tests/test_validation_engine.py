@@ -372,10 +372,29 @@ def test_a_demoted_check_still_costs_the_full_weight_of_its_check(factory, direc
     assert check.contribution == -check.weight
 
 
-@pytest.mark.parametrize("factory,direction,name", _DEMOTED, ids=_DEMOTED_IDS)
+# probability_score is left out here: it re-reads the confidence base, so its
+# disagreement is now applied exactly at the base by
+# trade_decision.directional_confidence rather than a second time here.
+_SCORED_DEMOTED = [d for d in _DEMOTED if d[2] not in ve._CONFIDENCE_EXCLUDED]
+
+
+@pytest.mark.parametrize("factory,direction,name", _SCORED_DEMOTED,
+                         ids=[name for _, _, name in _SCORED_DEMOTED])
 def test_a_demoted_check_reduces_the_score(factory, direction, name):
     clean = _validate(_context(), direction="long").adjustment
     assert _validate(factory(), direction=direction).adjustment < clean
+
+
+def test_probability_score_does_not_count_the_base_twice():
+    """It reads scoring.confidence — the base itself. Still found, still
+    reported, but it must not move the adjustment, or the base is added to
+    itself."""
+    baseline = _validate(_context())
+    result = _validate(_opposite_probability_context(), direction="long")
+
+    assert _check(result, "probability_score").severity is ve.Severity.WEAKNESS
+    assert "probability_score" in {c.name for c in result.weaknesses}
+    assert result.adjustment == baseline.adjustment
 
 
 # ----------------------------------------------------------- adverse excursion
@@ -808,12 +827,95 @@ def test_the_execution_set_is_exactly_the_checks_that_read_the_trade():
     assert _validate(market).adjustment != baseline.adjustment
 
 
-def test_every_execution_check_is_a_known_weight():
-    assert ve._EXECUTION_CHECKS <= set(ve._WEIGHTS)
+def test_every_excluded_check_is_a_known_weight():
+    assert ve._CONFIDENCE_EXCLUDED <= set(ve._WEIGHTS)
+    assert ve._CONFIDENCE_EXCLUDED == (
+        ve._EXECUTION_CHECKS | ve._NON_TECHNICAL_CHECKS | ve._DUPLICATES_THE_BASE)
 
 
-def test_directional_checks_are_the_majority_of_the_evidence():
-    """Confidence must still rest on a broad base after the exclusion."""
-    directional = {n: w for n, w in ve._WEIGHTS.items() if n not in ve._EXECUTION_CHECKS}
-    assert len(directional) == len(ve._WEIGHTS) - len(ve._EXECUTION_CHECKS)
-    assert sum(directional.values()) > sum(ve._WEIGHTS.values()) / 2
+def test_technical_checks_are_the_majority_of_the_evidence():
+    """Confidence must still rest on a broad base after the exclusions."""
+    technical = {n: w for n, w in ve._WEIGHTS.items() if n not in ve._CONFIDENCE_EXCLUDED}
+    assert len(technical) == len(ve._WEIGHTS) - len(ve._CONFIDENCE_EXCLUDED)
+    assert sum(technical.values()) > sum(ve._WEIGHTS.values()) / 2
+
+
+# ------------------------------------------ confidence is technical-only
+
+def test_news_does_not_move_confidence():
+    """An economic calendar is event data, not price action. It still blocks
+    through the risk engine — it just no longer discounts a technical read."""
+    cal = StaticCalendar([EconomicEvent.create("FOMC Statement", _ts(), "USD")])
+    baseline = _validate(_context())
+    ctx = _context()
+    ctx.news = NewsFilter(cal).check("XAUUSD", _ts())
+    result = _validate(ctx)
+
+    assert result.bonus == baseline.bonus
+    assert result.penalty == baseline.penalty
+    assert _check(result, "news").severity is ve.Severity.WEAKNESS   # still found
+    assert "news" in {c.name for c in result.weaknesses}             # still reported
+
+
+def test_session_quality_does_not_move_confidence():
+    """The clock is not a chart."""
+    baseline = _validate(_context())
+    for hour in (0, 3, 8, 13, 18, 22):      # Asia, London, NY, overlaps, off-hours
+        ctx = _context()
+        ctx.session = session_info(_ts().replace(hour=hour))
+        result = _validate(ctx)
+        assert result.bonus == baseline.bonus, hour
+        assert result.penalty == baseline.penalty, hour
+
+
+def test_every_confidence_input_is_price_derived():
+    """The whole point, stated as an invariant: nothing that feeds confidence
+    may read the calendar, the clock, or the trade's own parameters."""
+    import inspect
+    non_price = {"context.news": "news", "context.session": "clock",
+                 "context.quality": "trade parameters"}
+    offenders = []
+    for fname, fn in vars(ve).items():
+        if not (fname.startswith(("_check_", "_event_alignment")) and callable(fn)):
+            continue
+        src = inspect.getsource(fn)
+        reads = [label for token, label in non_price.items() if token in src]
+        if not reads:
+            continue
+        keys = [k for k in ve._WEIGHTS
+                if k in fname.replace("_check_", "") or fname.replace("_check_", "") in k]
+        for key in keys:
+            if key not in ve._CONFIDENCE_EXCLUDED:
+                offenders.append((key, reads))
+    assert not offenders, f"non-technical inputs still feed confidence: {offenders}"
+
+
+def test_excluded_checks_all_still_run_and_are_reported():
+    """Excluded from the number, not from the analysis."""
+    cal = StaticCalendar([EconomicEvent.create("FOMC Statement", _ts(), "USD")])
+    ctx = _context()
+    ctx.spread = 1.0
+    ctx.news = NewsFilter(cal).check("XAUUSD", _ts())
+    result = _validate(ctx)
+
+    names = {c.name for c in result.checks}
+    for name in ve._CONFIDENCE_EXCLUDED:
+        assert name in names, f"{name} stopped running"
+    reported = {c.name for c in result.weaknesses} | {c.name for c in result.strengths}
+    assert ve._NON_TECHNICAL_CHECKS & reported, "no non-technical finding reached the report"
+
+
+def test_validation_defaults_to_the_trades_direction_not_the_engines():
+    """Regression: the default read ``quality.setup``, which does not exist,
+    so a caller passing no direction was validated against the scoring
+    engine's side — the wrong trade."""
+    ctx = _context()                    # scoring engine reads BUY
+    ctx.setup = TradeSetup(symbol="XAUUSD", direction="short", order_type="limit",
+                           entries=[100.0], stop_loss=106.0, take_profits=[80.0])
+
+    implicit = ve.ValidationEngine().validate(ctx)            # no direction passed
+    explicit = ve.ValidationEngine().validate(ctx, direction="short")
+
+    assert implicit.bonus == explicit.bonus
+    assert implicit.penalty == explicit.penalty
+    assert _check(implicit, "higher_timeframe_trend").severity is ve.Severity.WEAKNESS

@@ -196,6 +196,37 @@ def _is_missing_reply_target(exc: BaseException) -> bool:
     return any(marker in lowered for marker in _MISSING_REPLY_MARKERS)
 
 
+# A destination in one of these states will never accept another message, so
+# a subscription to it should be dropped rather than retried on every signal
+# for the rest of the deployment's life.
+#
+# ``Forbidden`` covers the whole class on its own — Telegram raises it for a
+# user who blocked the bot, a deactivated account, and a bot removed from a
+# group or channel. The string markers catch the ``BadRequest`` cases, which
+# share a class with recoverable errors and so cannot be told apart by type.
+_UNREACHABLE_MARKERS = (
+    "chat not found",
+    "user is deactivated",
+    "peer_id_invalid",
+    "chat_id is empty",
+)
+
+
+def _is_unreachable_forever(exc: BaseException) -> bool:
+    """True when this chat can never receive another message.
+
+    Deliberately narrow: anything not recognised here keeps the subscription
+    and is reported as a delivery failure, because wrongly unsubscribing a
+    live user is far worse than logging a recoverable error twice.
+    """
+    if isinstance(exc, Forbidden):
+        return True
+    if isinstance(exc, BadRequest):
+        lowered = str(exc).lower()
+        return any(marker in lowered for marker in _UNREACHABLE_MARKERS)
+    return False
+
+
 def _esc(text: str) -> str:
     """HTML-escape dynamic text before interpolating into a formatted message.
 
@@ -405,6 +436,15 @@ class TelegramBot:
             try:
                 await self._send_to(destination, message, html_text)
             except Exception as exc:  # noqa: BLE001 - delivery never breaks the pipeline
+                if _is_unreachable_forever(exc):
+                    # The chat is gone for good: blocked, deactivated, kicked
+                    # or deleted. Retrying it on every future signal would
+                    # log an error per report forever and never succeed, so
+                    # the subscription is dropped instead. Expected
+                    # lifecycle, not a fault — hence INFO, and it is not
+                    # counted as a delivery failure.
+                    await self._drop_subscriber(destination, reason=str(exc))
+                    continue
                 self._stats.notifications_failed += 1
                 log.error(
                     "bot_report_failed destination=%s message_id=%s error=%s: %s",
@@ -420,6 +460,32 @@ class TelegramBot:
         self._stats.notifications_sent += 1
         log.info("bot_report_sent message_id=%s delivered=%d/%d chars=%d",
                  message.id, delivered, len(destinations), len(html_text))
+
+    async def _drop_subscriber(self, destination: ChatRef, *, reason: str) -> None:
+        """Unsubscribe a chat that can never be reached again.
+
+        Only a *subscription* is dropped. ``TELEGRAM_BOT_CHAT_ID`` is
+        configuration, not something this bot may delete, so an unreachable
+        fallback is reported loudly and left alone for an operator to fix.
+        """
+        if not isinstance(destination, int) or destination not in self._subscribers:
+            log.warning(
+                "bot_destination_unreachable destination=%s reason=%s "
+                "— not a subscription, left configured",
+                destination, reason,
+            )
+            return
+
+        self._subscribers.discard(destination)
+        if self._storage is not None:
+            try:
+                await self._storage.remove_subscriber(destination)
+            except Exception:  # noqa: BLE001 - never break delivery over this
+                log.exception("bot_auto_unsubscribe_persist_failed chat_id=%s", destination)
+        log.info(
+            "bot_auto_unsubscribed chat_id=%s reason=%s remaining=%d",
+            destination, reason, len(self._subscribers),
+        )
 
     def _destinations(self) -> List[ChatRef]:
         """Who the next report goes to.

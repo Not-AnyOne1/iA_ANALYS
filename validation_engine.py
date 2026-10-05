@@ -214,6 +214,55 @@ _EXECUTION_CHECKS = frozenset({
 })
 
 
+# Checks that describe the WORLD rather than the CHART.
+#
+# Confidence is a purely technical read: the probability that price moves the
+# predicted way, judged from price action alone. These two are real and
+# useful findings, but neither is derived from price — one comes from an
+# economic calendar, the other from the clock — so neither belongs in a
+# technical score.
+#
+# The rule for membership mirrors the one above and is equally testable: a
+# check belongs here if it reads something other than the chart.
+#
+# Like the execution checks, these still RUN, still appear in the report, and
+# are still sent to Claude. ``news`` additionally keeps its full blocking
+# power: ``risk_engine._check_news`` rejects a blackout outright, so an
+# imminent release still stops a trade — through the gate that owns
+# blocking, not by quietly discounting a technical score.
+_NON_TECHNICAL_CHECKS = frozenset({
+    "news",             # economic calendar: event data, not price action
+    "session_quality",  # clock time: not derived from price
+})
+
+
+# Checks that re-read the confidence BASE itself.
+#
+# ``probability_score`` is not an independent model: it reads
+# ``scoring.confidence`` and ``scoring.direction`` — the very number that is
+# already the base of the confidence formula. Counting it here made
+# confidence ``D + f(D) + ...``: a high base awarded itself a bonus and a low
+# one charged itself a penalty, amplifying whatever the base already said.
+#
+# Its one genuinely useful job, catching a scoring engine that reads the
+# opposite direction to the trade, is now done exactly in
+# ``trade_decision.directional_confidence``, which takes the base to zero.
+# Leaving this in as well would penalise that disagreement twice.
+#
+# Still runs and is still reported — "the probability model favours short,
+# not long" is exactly the line that explains to the reader, and to Claude,
+# why the base came out at zero.
+_DUPLICATES_THE_BASE = frozenset({
+    "probability_score",   # reads scoring.confidence — the base itself
+})
+
+
+# Everything kept out of the confidence number. Separate sets above rather
+# than one, so the report and a future reader can always tell *why* a
+# finding was excluded — trade management, not technical, or a duplicate.
+_CONFIDENCE_EXCLUDED = _EXECUTION_CHECKS | _NON_TECHNICAL_CHECKS | _DUPLICATES_THE_BASE
+
+
 def _check(name: str, severity: Severity, detail: str, ratio: float = 1.0) -> ValidationCheck:
     """Build a check, translating severity into a signed contribution.
 
@@ -669,8 +718,10 @@ class ValidationEngine:
         explicitly only when validating a hypothetical.
         """
         if direction is None:
-            quality = context.quality
-            direction = getattr(getattr(quality, "setup", None), "direction", None)
+            # The stated setup, not ``context.quality`` — TradeQuality has no
+            # ``setup`` field, so reading it there always returned None and
+            # silently validated against the scoring engine's side instead.
+            direction = getattr(getattr(context, "setup", None), "direction", None)
         if direction is None and context.scoring is not None:
             # Fall back to what the deterministic model itself implies, so a
             # market order with no stated side is still challenged.
@@ -706,14 +757,22 @@ class ValidationEngine:
     def _adjustments(checks: Sequence[ValidationCheck]) -> Tuple[int, int]:
         """Turn the checks into confidence points to add and to subtract.
 
-        Only the DIRECTIONAL checks are read. Confidence means one thing —
-        how likely price is to move the way we predicted — so the checks in
-        :data:`_EXECUTION_CHECKS`, which describe the trade rather than the
-        market, are filtered out first. A perfect payoff cannot make a weak
-        read more likely to be right, and a tight stop cannot make a strong
-        read less likely to be right; both change whether the trade is worth
-        taking, which is the risk engine's question and the verdict's, not
-        this number's.
+        Only the TECHNICAL, DIRECTIONAL checks are read. Confidence means one
+        thing — how likely price is to move the way we predicted, judged from
+        price action alone — so everything in :data:`_CONFIDENCE_EXCLUDED` is
+        filtered out first:
+
+        * :data:`_EXECUTION_CHECKS` describe the trade, not the market. A
+          perfect payoff cannot make a weak read more likely to be right,
+          and a tight stop cannot make a strong read less likely to be
+          right; both change whether the trade is worth *taking*, which is
+          the risk engine's question and the verdict's, not this number's.
+        * :data:`_NON_TECHNICAL_CHECKS` describe the world, not the chart —
+          an economic calendar and the clock. Real findings, but not price
+          action, so not part of a technical score.
+
+        Both groups still run and are still reported; they reach the outcome
+        through the risk engine and the verdict bands instead.
 
         Let ``P`` and ``N`` be the summed positive and negative contributions
         of the directional checks, ``T`` their total possible weight, and
@@ -767,7 +826,7 @@ class ValidationEngine:
         # Directional evidence only. Trade-management findings are excluded
         # here and nowhere else: they still run, still appear in the report,
         # and still reach Claude and the risk engine.
-        directional = [c for c in checks if c.name not in _EXECUTION_CHECKS]
+        directional = [c for c in checks if c.name not in _CONFIDENCE_EXCLUDED]
 
         total = sum(c.weight for c in directional)
         if total <= 0:

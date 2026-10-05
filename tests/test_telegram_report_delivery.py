@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from telegram.error import BadRequest, TimedOut
+from telegram.error import BadRequest, Forbidden, TimedOut
 
 import report as report_mod
 from config import Settings
@@ -328,8 +328,12 @@ def test_falls_back_to_a_normal_message_when_the_reply_target_is_missing(tmp_pat
 
 def test_a_non_reply_bad_request_is_not_retried_as_plain(tmp_path):
     """Only a missing reply target triggers the fallback; a genuinely
-    malformed request must not be sent twice."""
-    bot, _, sends = _run(tmp_path, send_effect=BadRequest("chat not found"))
+    malformed request must not be sent twice.
+
+    Uses a recoverable BadRequest: "chat not found" would now be classified
+    as permanently unreachable and prune the destination instead.
+    """
+    bot, _, sends = _run(tmp_path, send_effect=BadRequest("can't parse entities"))
     assert len(sends) == 1
     assert bot._stats.notifications_failed == 1
 
@@ -525,3 +529,117 @@ def test_the_report_is_still_deduplicated_across_all_subscribers(tmp_path):
 
     assert bot._bot.send_message.await_count == 2      # two subscribers, once each
     assert bot._stats.duplicates_skipped == 1
+
+
+# -------------------------------------------- pruning dead subscribers
+
+def _bot_with_subscribers(tmp_path, *ids, send_effect=None):
+    """A bot with persisted subscribers, ready to send one report."""
+    from storage import Storage
+    bot = TelegramBot(BotSettings(bot_token="t", chat_id=None))
+    if send_effect is not None:
+        bot._bot.send_message = AsyncMock(side_effect=send_effect)
+    storage = Storage(tmp_path / "subs.db")
+    asyncio.run(storage.initialize())
+    for i in ids:
+        asyncio.run(storage.add_subscriber(i))
+    bot.attach_storage(storage)
+    bot._subscribers = set(ids)
+    return bot, storage
+
+
+def _deliver(bot, message_id=1):
+    asyncio.run(bot.send_report(_msg(message_id=message_id), "<b>report</b>"))
+
+
+def test_a_user_who_blocked_the_bot_is_unsubscribed(tmp_path):
+    """The reported bug: without this the dead chat is retried on every
+    signal forever, logging an error each time and never succeeding."""
+    def effect(*args, **kwargs):
+        if kwargs.get("chat_id") == 222:
+            raise Forbidden("Forbidden: bot was blocked by the user")
+        return None
+
+    bot, storage = _bot_with_subscribers(tmp_path, 111, 222, 333, send_effect=effect)
+    _deliver(bot)
+
+    assert bot._subscribers == {111, 333}
+    assert asyncio.run(storage.subscribers()) == [111, 333]   # persisted too
+
+
+def test_the_others_still_get_the_report(tmp_path):
+    def effect(*args, **kwargs):
+        if kwargs.get("chat_id") == 222:
+            raise Forbidden("bot was blocked by the user")
+        return None
+
+    bot, _ = _bot_with_subscribers(tmp_path, 111, 222, 333, send_effect=effect)
+    _deliver(bot)
+
+    sends = bot._bot.send_message.await_args_list
+    assert sorted(c.kwargs["chat_id"] for c in sends) == [111, 222, 333]
+    assert bot._stats.notifications_sent == 1
+
+
+def test_a_blocked_user_is_not_counted_as_a_delivery_failure(tmp_path):
+    """Expected lifecycle, not a fault — it must not inflate the error count."""
+    bot, _ = _bot_with_subscribers(
+        tmp_path, 111, send_effect=Forbidden("bot was blocked by the user"))
+    _deliver(bot)
+
+    assert bot._stats.notifications_failed == 0
+    assert bot._subscribers == set()
+
+
+def test_a_pruned_subscriber_is_not_retried_on_the_next_signal(tmp_path):
+    """The whole point: the error happens once, not once per report."""
+    bot, _ = _bot_with_subscribers(
+        tmp_path, 111, send_effect=Forbidden("bot was blocked by the user"))
+
+    _deliver(bot, message_id=1)
+    first_round = bot._bot.send_message.await_count
+    _deliver(bot, message_id=2)
+
+    assert first_round == 1
+    assert bot._bot.send_message.await_count == 1    # never attempted again
+
+
+@pytest.mark.parametrize("exc", [
+    Forbidden("bot was blocked by the user"),
+    Forbidden("user is deactivated"),
+    Forbidden("bot was kicked from the supergroup chat"),
+    BadRequest("Chat not found"),
+    BadRequest("PEER_ID_INVALID"),
+])
+def test_every_permanently_dead_state_prunes(tmp_path, exc):
+    bot, _ = _bot_with_subscribers(tmp_path, 111, send_effect=exc)
+    _deliver(bot)
+    assert bot._subscribers == set(), exc
+
+
+@pytest.mark.parametrize("exc", [
+    TimedOut(),
+    BadRequest("can't parse entities"),
+    BadRequest("message is too long"),
+])
+def test_a_recoverable_failure_keeps_the_subscriber(tmp_path, exc):
+    """Wrongly unsubscribing a live user is worse than a logged error."""
+    bot, storage = _bot_with_subscribers(tmp_path, 111, send_effect=exc)
+    _deliver(bot)
+
+    assert bot._subscribers == {111}
+    assert asyncio.run(storage.subscribers()) == [111]
+    assert bot._stats.notifications_failed == 1
+
+
+def test_an_unreachable_configured_chat_is_never_deleted(tmp_path):
+    """TELEGRAM_BOT_CHAT_ID is configuration, not a subscription — the bot
+    reports it for an operator and leaves it alone."""
+    bot = TelegramBot(BotSettings(bot_token="t", chat_id=12345))
+    bot._bot.send_message = AsyncMock(
+        side_effect=Forbidden("bot was blocked by the user"))
+
+    _deliver(bot)
+
+    assert bot._destinations() == [12345]     # still configured
+    assert bot._subscribers == set()

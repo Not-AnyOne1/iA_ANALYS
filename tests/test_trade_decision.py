@@ -610,3 +610,105 @@ def test_there_is_exactly_one_confidence_on_the_decision():
                  "confidence_bound_by", "ceiling", "ceiling_reason"):
         assert gone not in fields, f"{gone} is a second confidence or a ceiling"
     assert "confidence" in fields and "adjusted_score" in fields
+
+
+# ------------------------------------------- confidence follows the TRADE
+
+def _scoring_for(net_score: float, confidence: int = 85) -> ScoringResult:
+    direction = (ScoreDirection.BUY if net_score > 0 else
+                 ScoreDirection.SELL if net_score < 0 else ScoreDirection.NONE)
+    trend = TrendDirection.BULLISH if net_score > 0 else TrendDirection.BEARISH
+    return ScoringResult(
+        symbol="XAUUSD", timeframe=Timeframe.H1, direction=direction,
+        confidence=confidence, net_score=net_score, total_possible=106.0,
+        breakdown=(FactorScore("trend", 20.0, 20.0, trend, "t"),), reasons=("t",))
+
+
+def _context_trading(direction, *, net_score, confidence=85, bonus=5, penalty=0):
+    from models import TradeSetup
+    ctx = _context(confidence=confidence, bonus=bonus, penalty=penalty)
+    ctx.scoring = _scoring_for(net_score, confidence)
+    ctx.setup = TradeSetup(symbol="XAUUSD", direction=direction, order_type="limit",
+                           entries=[100.0], stop_loss=95.0, take_profits=[115.0])
+    return ctx
+
+
+def test_a_signal_against_the_analysis_is_not_confident():
+    """The bug: a strongly BULLISH read (engine 85% confident, BUY) reported
+    85 as the base for a SELL signal, giving SELL conf 70 -> ENTER. The system
+    confidently recommended the trade against its own analysis."""
+    from trade_decision import decide_deterministically
+    ctx = _context_trading("short", net_score=+80.0, confidence=85)
+
+    trace = decide_deterministically(ctx)
+
+    assert trace.deterministic_score == 0
+    assert trace.verdict is not Action.ENTER
+
+
+def test_a_signal_with_the_analysis_keeps_its_confidence():
+    from trade_decision import decide_deterministically
+    trace = decide_deterministically(_context_trading("long", net_score=+80.0, confidence=85))
+
+    assert trace.deterministic_score == 85
+    assert trace.verdict is Action.ENTER
+
+
+@pytest.mark.parametrize("trade,net,expected", [
+    ("long",  +80.0, 85),    # engine bullish, trade long  -> with the analysis
+    ("short", -80.0, 85),    # engine bearish, trade short -> with the analysis
+    ("long",  -80.0, 0),     # engine bearish, trade long  -> against it
+    ("short", +80.0, 0),     # engine bullish, trade short -> against it
+])
+def test_confidence_is_measured_from_the_trades_side(trade, net, expected):
+    from trade_decision import directional_confidence
+    assert directional_confidence(_scoring_for(net, 85), trade) == expected
+
+
+def test_buy_and_sell_are_treated_symmetrically():
+    from trade_decision import directional_confidence
+    for conf in (10, 40, 60, 85, 100):
+        assert (directional_confidence(_scoring_for(+50.0, conf), "long")
+                == directional_confidence(_scoring_for(-50.0, conf), "short"))
+        assert (directional_confidence(_scoring_for(+50.0, conf), "short")
+                == directional_confidence(_scoring_for(-50.0, conf), "long") == 0)
+
+
+def test_the_favoured_side_comes_from_net_score_not_the_reported_direction():
+    """``direction`` is forced to NONE below the reporting threshold while
+    the evidence still leans one way. The lean must still count."""
+    from trade_decision import directional_confidence
+    weak_bull = ScoringResult(
+        symbol="XAUUSD", timeframe=Timeframe.H1, direction=ScoreDirection.NONE,
+        confidence=8, net_score=+3.0, total_possible=106.0, breakdown=(), reasons=())
+    assert directional_confidence(weak_bull, "long") == 8
+    assert directional_confidence(weak_bull, "short") == 0
+
+
+def test_a_signal_with_no_direction_uses_the_engines_own_read():
+    from trade_decision import directional_confidence
+    assert directional_confidence(_scoring_for(+80.0, 85), None) == 85
+    assert directional_confidence(_scoring_for(-80.0, 85), None) == 85
+
+
+def test_a_dead_tie_has_no_confidence_either_way():
+    from trade_decision import directional_confidence
+    tie = ScoringResult(symbol="XAUUSD", timeframe=Timeframe.H1,
+                        direction=ScoreDirection.NONE, confidence=0, net_score=0.0,
+                        total_possible=106.0, breakdown=(), reasons=())
+    assert directional_confidence(tie, "long") == directional_confidence(tie, "short") == 0
+
+
+def test_the_report_and_telegram_card_show_the_directional_number():
+    """The number a trader reads must be confidence in the side shown."""
+    import asyncio as _asyncio
+    engine = TradeDecisionEngine(_settings())
+    engine._run_cli = AsyncMock(return_value=(0, _envelope(), ""))
+    ctx = _context_trading("short", net_score=+80.0, confidence=85)
+
+    decision = _asyncio.run(engine.decide(ctx))
+    card = report_mod.render_telegram_report(ctx, decision)
+
+    assert decision.deterministic_score == 0
+    assert "SELL" in card
+    assert "85%" not in card

@@ -187,6 +187,34 @@ class DecisionTrace:
                 f"- {self.validation_penalty} = {self.adjusted_score}")
 
 
+def directional_confidence(scoring, trade_direction: Optional[str]) -> int:
+    """Confidence that price moves in the TRADE's direction.
+
+    ``scoring.confidence`` is the engine's conviction in *its own* winning
+    side, whichever that is. Used unexamined it reports a strongly bullish
+    read as high confidence in a SELL — the system would confidently
+    recommend the trade against its own analysis.
+
+    This is not an arbitrary rule bolted on top. The confidence curve is
+    built from the margin ``(winner - loser) / cast`` and is defined as zero
+    for any margin at or below zero. Measured from the trade's side instead
+    of the engine's, a trade on the losing side has a negative margin — so
+    the same curve gives exactly zero. The engine is simply being asked the
+    right question.
+
+    The favoured side is read from the sign of ``net_score`` rather than
+    from ``direction``, because ``direction`` is forced to NONE below the
+    reporting threshold while the evidence still leans one way.
+
+    With no stated direction the signal has nothing to contradict, so the
+    engine's own read is the prediction and is returned unchanged.
+    """
+    if trade_direction not in ("long", "short") or scoring.net_score == 0:
+        return scoring.confidence
+    favours = "long" if scoring.net_score > 0 else "short"
+    return scoring.confidence if favours == trade_direction else 0
+
+
 def decide_deterministically(context: MarketContext) -> DecisionTrace:
     """The decision. Complete, deterministic, and the only one there is.
 
@@ -210,10 +238,15 @@ def decide_deterministically(context: MarketContext) -> DecisionTrace:
     bonus = validation.bonus if validation is not None else 0
     penalty = validation.penalty if validation is not None else 0
 
+    # Conviction in the direction actually being traded — not in whichever
+    # side the engine happened to favour. See ``directional_confidence``.
+    trade_direction = getattr(context.setup, "direction", None)
+    base = directional_confidence(scoring, trade_direction) if scoring is not None else None
+
     def trace(verdict: Action, reason: str, *, adjusted: Optional[int],
               blocked: bool = False) -> DecisionTrace:
         return DecisionTrace(
-            deterministic_score=scoring.confidence if scoring is not None else None,
+            deterministic_score=base,
             validation_bonus=bonus, validation_penalty=penalty,
             adjusted_score=adjusted, verdict=verdict, reason=reason, blocked=blocked,
         )
@@ -240,7 +273,7 @@ def decide_deterministically(context: MarketContext) -> DecisionTrace:
         return trace(Action.SKIP, "no risk assessment ran", adjusted=None)
 
     # 3. The single clamp, applied once to the finished arithmetic.
-    adjusted = max(0, min(100, scoring.confidence + bonus - penalty))
+    adjusted = max(0, min(100, base + bonus - penalty))
 
     if adjusted < WAIT_MIN_SCORE:
         return trace(Action.SKIP,
