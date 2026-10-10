@@ -164,7 +164,7 @@ _DASHBOARD_HTML = """\
 <h2>Recent analyses</h2>
 <table id="recent"><thead><tr><th>Time</th><th>Symbol</th><th>Category</th><th>Confidence</th></tr></thead><tbody></tbody></table>
 <h2>Decision history</h2>
-<table id="decisions"><thead><tr><th>Time</th><th>Symbol</th><th>Verdict</th><th>Confidence</th></tr></thead><tbody></tbody></table>
+<table id="decisions"><thead><tr><th>Time</th><th>Symbol</th><th>Verdict</th><th>Confluence</th></tr></thead><tbody></tbody></table>
 <h2>Signal timeline</h2>
 <table id="signals"><thead><tr><th>Time</th><th>Symbol</th><th>Direction</th><th>Summary</th></tr></thead><tbody></tbody></table>
 
@@ -194,7 +194,7 @@ async function load() {
   const decisions = await j('/api/decisions?limit=20');
   document.querySelector('#decisions tbody').innerHTML = decisions.map(d =>
     `<tr><td>${d.recorded_at}</td><td>${d.symbol||''}</td>` +
-    `<td>${d.decision_verdict||''}</td><td>${d.decision_confidence!=null?d.decision_confidence+'%':''}</td></tr>`).join('');
+    `<td>${d.decision_verdict||''}</td><td>${d.decision_confidence!=null?d.decision_confidence+'/100':''}</td></tr>`).join('');
 
   const signals = await j('/api/signals?limit=20');
   document.querySelector('#signals tbody').innerHTML = signals.map(sig =>

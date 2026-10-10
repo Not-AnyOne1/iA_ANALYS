@@ -18,6 +18,8 @@ from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from trade_geometry import check_geometry
+
 Direction = Literal["long", "short"]
 OrderType = Literal["market", "limit", "stop", "unknown"]
 MessageCategory = Literal[
@@ -84,14 +86,15 @@ class TradeSetup(BaseModel):
 
     @property
     def risk_reward(self) -> Optional[float]:
-        """Reward-to-risk ratio against the first target, when computable."""
-        if not self.entries or self.stop_loss is None or not self.take_profits:
-            return None
-        entry = sum(self.entries) / len(self.entries)
-        risk = abs(entry - self.stop_loss)
-        if risk == 0:
-            return None
-        return abs(self.take_profits[0] - entry) / risk
+        """Reward-to-risk ratio against the first target, when the levels
+        form a valid trade in the stated direction.
+
+        Directional by construction: ``None`` for an inverted or degenerate
+        setup rather than a number. The previous ``abs()``-based ratio gave a
+        SHORT with a long's levels a healthy-looking 2.0.
+        """
+        return check_geometry(self.direction, self.entries, self.stop_loss,
+                              self.take_profits).risk_reward
 
 
 class SignalAnalysis(BaseModel):

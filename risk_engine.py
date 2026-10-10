@@ -24,9 +24,11 @@ legitimate style, low volatility can change within the life of the trade, a
 stop or target placement is an opinion about levels, a wide spread is a cost
 — rather than a fact about whether the trade can be placed at all.
 
-Two rules still gate, and they are the objective blockers: ``risk_reward``
-(a payoff too thin to survive costs) and ``news`` (a scheduled release that
-makes price unmodellable). Only ``REJECT`` sets ``approved = False``.
+Three rules gate, and they are the objective blockers: ``trade_geometry``
+(the levels do not describe a placeable trade in its direction — checked
+first, see ``trade_geometry.py``), ``risk_reward`` (a payoff too thin to
+survive costs) and ``news`` (a scheduled release that makes price
+unmodellable). Only ``REJECT`` sets ``approved = False``.
 """
 
 from __future__ import annotations
@@ -109,6 +111,23 @@ class RiskAssessment:
                 notes.append(f"{len(self.abstentions)} check(s) had no data")
             return "approved" + (f" ({', '.join(notes)})" if notes else "")
         return "; ".join(f"{c.name}: {c.detail}" for c in self.rejections)
+
+
+def _check_geometry(quality: TradeQuality) -> RiskCheck:
+    """The trade's levels must describe a placeable trade in its direction.
+
+    An objective blocker in the strictest sense: an inverted, zero-risk or
+    malformed setup is not a bad trade, it is not a trade. It is checked
+    before anything else and rejects outright — no score is computed for it,
+    and nothing about the analysis can override it.
+
+    Missing levels reject too. Risk/reward must be validated before a trade
+    may become ENTER, and a trade with no stop or no target cannot be.
+    """
+    geometry = quality.geometry
+    if geometry.valid:
+        return RiskCheck("trade_geometry", RiskVerdict.PASS, geometry.reason)
+    return RiskCheck("trade_geometry", RiskVerdict.REJECT, geometry.reason)
 
 
 def _check_risk_reward(quality: TradeQuality, settings: RiskSettings) -> RiskCheck:
@@ -207,9 +226,9 @@ def _check_confidence(confidence: Optional[int], settings: RiskSettings) -> Risk
     if confidence < settings.min_confidence:
         # WARN, not REJECT. A low deterministic score is a market *opinion* —
         # "the evidence does not strongly favour this" — not an objective
-        # blocker, and this gate duplicated the decision bands in
-        # ``trade_decision.py``, which already send a low score to WAIT or
-        # SKIP. Rejecting here as well made the same fact veto twice.
+        # blocker, and this gate duplicated the decision threshold in
+        # ``trade_decision.py``, which already sends a low score to SKIP.
+        # Rejecting here as well made the same fact veto twice.
         return RiskCheck("confidence", RiskVerdict.WARN,
                          f"confidence {confidence} below the {settings.min_confidence} minimum")
     return RiskCheck("confidence", RiskVerdict.PASS, f"confidence {confidence}")
@@ -241,6 +260,7 @@ def evaluate(
     """Run every rule. Approved only when nothing rejected."""
     cfg = settings or RiskSettings()
     checks: List[RiskCheck] = [
+        _check_geometry(quality),
         _check_risk_reward(quality, cfg),
         _check_stop(quality),
         _check_target(quality),

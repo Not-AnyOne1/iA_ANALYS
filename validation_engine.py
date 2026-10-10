@@ -54,6 +54,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional, Sequence, Tuple
 
+from evidence_groups import VALIDATION_GROUPS, scale_factors
 from market_data import Candle
 from news_filter import NewsStatus
 from sessions import Session, SessionInfo
@@ -147,11 +148,12 @@ MAX_ADJUSTMENT = 25
 
 # The most the review may TAKE AWAY, reached only at total contradiction
 # (every possible check fired, all of them against). Derived from the
-# decision bands rather than chosen:
+# original 40/60 decision bands rather than chosen (and left unchanged when
+# the decision became a single ENTER/SKIP cut at 50):
 #
 #   100 - 40 = 60   the bare minimum, so that TOTAL contradiction can carry
-#                   the highest attainable confidence below the SKIP
-#                   threshold instead of stalling in WAIT
+#                   the highest attainable confidence below the old SKIP
+#                   threshold
 #   +      20       one band width of margin, so that *overwhelming*
 #                   contradiction — not only the unreachable total — can do
 #                   it too
@@ -190,8 +192,9 @@ _WEIGHTS = {
 
 # Checks that describe the TRADE rather than the MARKET.
 #
-# Confidence answers one question — how likely is price to move the way we
-# predicted — so only evidence about the market may move it. Whether the
+# The score answers one question — how much technical evidence supports the
+# predicted direction (a confluence measure, not a calibrated probability) —
+# so only evidence about the market may move it. Whether the
 # stop is well placed, whether the payoff is worth taking, and what the
 # spread costs are all real findings, but they say nothing about direction:
 # a 1:3 payoff does not make a weak read more likely to be right, and a
@@ -216,8 +219,9 @@ _EXECUTION_CHECKS = frozenset({
 
 # Checks that describe the WORLD rather than the CHART.
 #
-# Confidence is a purely technical read: the probability that price moves the
-# predicted way, judged from price action alone. These two are real and
+# The score is a purely technical read: how much price-action evidence
+# supports the predicted direction (confluence, not a probability). These
+# two are real and
 # useful findings, but neither is derived from price — one comes from an
 # economic calendar, the other from the clock — so neither belongs in a
 # technical score.
@@ -252,15 +256,57 @@ _NON_TECHNICAL_CHECKS = frozenset({
 # Still runs and is still reported — "the probability model favours short,
 # not long" is exactly the line that explains to the reader, and to Claude,
 # why the base came out at zero.
+#
+# The other five re-read the very objects the base already scores. Each takes
+# ``max(..., key=candle_index)`` of the same list the matching scoring factor
+# reads and compares its direction with the trade — which is that factor's
+# vote measured from the trade's side, exactly what
+# ``trade_decision.directional_confidence`` already does with the base:
+#
+#   bos_alignment        latest BOS            = scoring factor "bos"
+#   choch_alignment      latest CHoCH          = scoring factor "choch"
+#   order_block_quality  latest order block    = scoring factor "order_block"
+#                        (a broken block is also gone from supply/demand)
+#   fvg_quality          latest FVG            = scoring factor "fvg"
+#                        (an inverted gap is also the scoring "inverse_fvg")
+#   liquidity_direction  latest sweep          = scoring factor "liquidity_sweep"
+#
+# Counting them here as well made one strong move arrive twice — once in the
+# base, again as review "strengths" — which is the double counting the
+# confluence redesign exists to remove. Like probability_score they still
+# run and are still reported, as the plain-language reading of the base.
 _DUPLICATES_THE_BASE = frozenset({
-    "probability_score",   # reads scoring.confidence — the base itself
+    "probability_score",     # reads scoring.confidence — the base itself
+    "bos_alignment",
+    "choch_alignment",
+    "order_block_quality",
+    "fvg_quality",
+    "liquidity_direction",
+})
+
+
+# Checks whose question now has a single owner in ``entry_quality``: "is
+# there room before the next level?". Room is graded there against MAJOR
+# levels only (multi-touch liquidity, unswept H4 swings, the previous day's
+# extremes) and in units of the trade's own risk. These three measure the
+# distance to ANY swing — in the 53-signal audit "near liquidity" fired on
+# 94% of signals, because almost every entry sits near some swing — so they
+# deducted points from nearly every trade without telling trades apart, and
+# scoring them as well would count the same obstacle twice. They still run
+# and are still reported.
+_OWNED_BY_ENTRY_QUALITY = frozenset({
+    "distance_to_support",
+    "distance_to_resistance",
+    "distance_from_liquidity",
 })
 
 
 # Everything kept out of the confidence number. Separate sets above rather
 # than one, so the report and a future reader can always tell *why* a
-# finding was excluded — trade management, not technical, or a duplicate.
-_CONFIDENCE_EXCLUDED = _EXECUTION_CHECKS | _NON_TECHNICAL_CHECKS | _DUPLICATES_THE_BASE
+# finding was excluded — trade management, not technical, a duplicate, or
+# a question entry_quality owns.
+_CONFIDENCE_EXCLUDED = (_EXECUTION_CHECKS | _NON_TECHNICAL_CHECKS | _DUPLICATES_THE_BASE
+                        | _OWNED_BY_ENTRY_QUALITY)
 
 
 def _check(name: str, severity: Severity, detail: str, ratio: float = 1.0) -> ValidationCheck:
@@ -521,8 +567,11 @@ def _check_volatility(context, direction) -> ValidationCheck:
                       "volatility is low — the target may never be reached",
                       ratio=1.0)
     if state == "high":
-        return _check(name, Severity.WEAKNESS,
-                      "volatility is high — stops are more likely to be swept")
+        # Reported, not scored: the concern is the STOP being swept, and stop
+        # risk is a warning for the trader (trade_decision.stop_loss_risk),
+        # never a reason to skip. It fired on 92% of audited signals.
+        return _check(name, Severity.NEUTRAL,
+                      "volatility is high — stops are more likely to be swept (SL risk warning)")
     return _check(name, Severity.STRENGTH, "volatility is normal")
 
 
@@ -686,10 +735,13 @@ def _check_max_adverse_excursion(context, direction) -> ValidationCheck:
 
 
 def _check_probability_score(context, direction) -> ValidationCheck:
+    # The name is historical and kept as the check's key; what it reads is the
+    # scoring engine's direction CONFLUENCE, which is not a probability, and
+    # the findings say so.
     name = "probability_score"
     scoring = context.scoring
     if scoring is None:
-        return _check(name, Severity.UNKNOWN, "no probability score")
+        return _check(name, Severity.UNKNOWN, "no direction confluence score")
     confidence = scoring.confidence
     # The scoring engine's own direction must agree with the trade.
     if direction and scoring.direction.value in ("buy", "sell"):
@@ -699,13 +751,13 @@ def _check_probability_score(context, direction) -> ValidationCheck:
             # the other way is a serious disagreement, but it is one model's
             # opinion over a fixed lookback — a judgement, not a blocker.
             return _check(name, Severity.WEAKNESS,
-                          f"the probability model favours {implied}, not {direction}",
+                          f"the scoring engine's evidence favours {implied}, not {direction}",
                           ratio=1.0)
     if confidence < 30:
-        return _check(name, Severity.WEAKNESS, f"probability score is only {confidence}")
+        return _check(name, Severity.WEAKNESS, f"direction confluence is only {confidence}/100")
     if confidence >= 60:
-        return _check(name, Severity.STRENGTH, f"probability score {confidence}")
-    return _check(name, Severity.STRENGTH, f"probability score {confidence}", ratio=0.5)
+        return _check(name, Severity.STRENGTH, f"direction confluence {confidence}/100")
+    return _check(name, Severity.STRENGTH, f"direction confluence {confidence}/100", ratio=0.5)
 
 
 class ValidationEngine:
@@ -755,12 +807,12 @@ class ValidationEngine:
 
     @staticmethod
     def _adjustments(checks: Sequence[ValidationCheck]) -> Tuple[int, int]:
-        """Turn the checks into confidence points to add and to subtract.
+        """Turn the checks into score points to add and to subtract.
 
-        Only the TECHNICAL, DIRECTIONAL checks are read. Confidence means one
-        thing — how likely price is to move the way we predicted, judged from
-        price action alone — so everything in :data:`_CONFIDENCE_EXCLUDED` is
-        filtered out first:
+        Only the TECHNICAL, DIRECTIONAL checks are read. The score means one
+        thing — how much price-action evidence supports the predicted
+        direction; a confluence measure, not a calibrated probability — so
+        everything in :data:`_CONFIDENCE_EXCLUDED` is filtered out first:
 
         * :data:`_EXECUTION_CHECKS` describe the trade, not the market. A
           perfect payoff cannot make a weak read more likely to be right,
@@ -820,6 +872,17 @@ class ValidationEngine:
         reviewing is not a source of market conviction, but it may remove
         more, because challenging the trade is what it is for.
 
+        **Evidence groups.** Before any of the above, checks that measure one
+        underlying condition are grouped (``evidence_groups.VALIDATION_GROUPS``)
+        and each group is worth its strongest member's weight — the same
+        single rule the scoring engine uses. One group is *confirm-only*: the
+        higher-timeframe trend, M15 confirmation and EMA200 side re-measure
+        the directional state the base already counts at full weight. Their
+        agreement earns no bonus, because it would count that state a second
+        time; it still counts as support in ``C``, so it still offsets
+        dissent exactly as before. Their dissent is charged in full — a
+        timeframe that contradicts the trade is new information.
+
         No clamping happens here; the single clamp is applied once in
         ``trade_decision`` after the arithmetic.
         """
@@ -827,13 +890,18 @@ class ValidationEngine:
         # here and nowhere else: they still run, still appear in the report,
         # and still reach Claude and the risk engine.
         directional = [c for c in checks if c.name not in _CONFIDENCE_EXCLUDED]
+        scale = scale_factors({c.name: c.weight for c in directional}, VALIDATION_GROUPS)
+        confirm_only = {m for g in VALIDATION_GROUPS if not g.adds_conviction
+                        for m in g.members}
 
-        total = sum(c.weight for c in directional)
+        total = sum(c.weight * scale[c.name] for c in directional)
         if total <= 0:
             return 0, 0
-        positive = sum(c.contribution for c in directional if c.contribution > 0)
-        negative = -sum(c.contribution for c in directional if c.contribution < 0)
-        bonus = round(MAX_ADJUSTMENT * positive / total)
+        scored = [(c.name, c.contribution * scale[c.name]) for c in directional]
+        positive = sum(v for _, v in scored if v > 0)
+        negative = -sum(v for _, v in scored if v < 0)
+        earned = sum(v for name, v in scored if v > 0 and name not in confirm_only)
+        bonus = round(MAX_ADJUSTMENT * earned / total)
 
         cast = positive + negative
         if cast <= 0:

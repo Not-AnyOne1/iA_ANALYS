@@ -85,7 +85,9 @@ class StatisticsSummary:
         if self.average_signal_confidence is not None:
             lines.append(f"Avg signal confidence: {self.average_signal_confidence * 100:.0f}%")
         if self.average_decision_confidence is not None:
-            lines.append(f"Avg decision confidence: {self.average_decision_confidence:.0f}%")
+            # The decision's score is a confluence score, not a probability,
+            # so it is never shown as a percentage.
+            lines.append(f"Avg decision confluence: {self.average_decision_confidence:.0f}/100")
 
         lines.append(
             "Verdicts: " + (

@@ -178,6 +178,21 @@ def atr(candles: Sequence[Candle], period: int = _DEFAULT_PERIOD) -> Optional[fl
     return _wilder_smooth(tr, period)[-1]
 
 
+def atr_series(candles: Sequence[Candle], period: int = _DEFAULT_PERIOD) -> List[Optional[float]]:
+    """Wilder's ATR at every candle, aligned index-for-index with ``candles``.
+
+    ``None`` until ``period`` true ranges exist. Each value uses only the
+    candles up to and including its own index — no later bar contributes —
+    and the last value is identical to :func:`atr`.
+    """
+    if period < 1:
+        raise ValueError(f"period must be >= 1, got {period}")
+    smoothed = _wilder_smooth(true_ranges(candles), period)
+    # true_ranges starts at candle 1, and the smoothing emits its first value
+    # at true range ``period - 1`` — i.e. at candle ``period``.
+    return [None] * (len(candles) - len(smoothed)) + list(smoothed)
+
+
 def atr_percent(candles: Sequence[Candle], period: int = _DEFAULT_PERIOD) -> Optional[float]:
     """ATR as a percentage of the last close — comparable across symbols,
     unlike raw ATR which is in the instrument's own price units."""

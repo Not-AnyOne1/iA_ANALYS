@@ -36,7 +36,7 @@ import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Awaitable, Callable, Dict, List, Optional, Protocol, Tuple, TypeVar
 
@@ -63,6 +63,32 @@ class Timeframe(str, Enum):
     H1 = "H1"
     H4 = "H4"
     D1 = "D1"
+
+    @property
+    def duration(self) -> timedelta:
+        """How long one bar lasts. A bar labelled ``t`` has closed once
+        ``t + duration`` has passed."""
+        return _TIMEFRAME_DURATION[self]
+
+
+_TIMEFRAME_DURATION = {
+    Timeframe.M1: timedelta(minutes=1), Timeframe.M5: timedelta(minutes=5),
+    Timeframe.M15: timedelta(minutes=15), Timeframe.M30: timedelta(minutes=30),
+    Timeframe.H1: timedelta(hours=1), Timeframe.H4: timedelta(hours=4),
+    Timeframe.D1: timedelta(days=1),
+}
+
+
+def closed_candles(candles, timeframe: "Timeframe", now: datetime) -> tuple:
+    """Only the bars that had finished by ``now``.
+
+    Providers return the bar still in progress as the last one. Its high,
+    low and close are provisional — a "break of structure" or a "sweep" seen
+    on it can be gone by the close — so nothing that reads structure or
+    computes an indicator may see it. Bars are labelled by their open time,
+    so a bar is closed once ``open + duration <= now``.
+    """
+    return tuple(c for c in candles if c.timestamp + timeframe.duration <= now)
 
 
 @dataclass(frozen=True)
@@ -234,6 +260,7 @@ class MarketDataService:
 
         provider = self._provider
         series = await self._call_with_retry(lambda: provider.get_candles(symbol, timeframe, limit))
+        series = clean_candle_series(series)
         self._validate_candle_series(series, expected_symbol=symbol, expected_timeframe=timeframe)
 
         await self._set_cached(self._candle_cache, key, series)
@@ -338,6 +365,67 @@ class MarketDataService:
             previous_ts = candle.timestamp
 
 
+# A weekend daily bar with less than this share of a normal weekday's range is
+# a stub, not a session. Observed XAUUSD weekend stubs are 0.3-6% of the
+# median weekday range; a real session — including crypto, which trades at
+# weekends — is nowhere near 10%.
+_WEEKEND_STUB_FRACTION = 0.10
+
+
+def clean_candle_series(series: CandleSeries) -> CandleSeries:
+    """Repair the two provider quirks that used to discard a whole series.
+
+    1. **Duplicate timestamps** (any timeframe). Twelve Data sent the daily
+       bar for 2026-10-04 twice; strict ordering then rejected the entire D1
+       series and the higher-timeframe trend silently disappeared. Bars that
+       share a label are merged into one — first open, highest high, lowest
+       low, last close — which is what a single bar for that period is.
+    2. **Flat weekend stubs** (daily only). Gold does not trade at weekends,
+       yet weekend-dated daily bars arrive with a few points of range. They
+       are not sessions; left in, they distort daily ATR and swings. Weekend
+       daily bars whose range is below ``_WEEKEND_STUB_FRACTION`` of the
+       median weekday range are dropped. Instruments that genuinely trade at
+       weekends keep them, because their weekend ranges are normal.
+
+    Anything else that is wrong — bars genuinely out of order, impossible
+    OHLC — is left for validation to reject. Changes are logged, not raised:
+    a cleaned series is a usable series.
+    """
+    merged: List[Candle] = []
+    duplicates = 0
+    for candle in series.candles:
+        if merged and candle.timestamp == merged[-1].timestamp:
+            first = merged[-1]
+            merged[-1] = Candle(
+                timestamp=first.timestamp, open=first.open,
+                high=max(first.high, candle.high), low=min(first.low, candle.low),
+                close=candle.close,
+                volume=(None if first.volume is None and candle.volume is None
+                        else (first.volume or 0.0) + (candle.volume or 0.0)),
+            )
+            duplicates += 1
+        else:
+            merged.append(candle)
+
+    stubs = 0
+    if series.timeframe is Timeframe.D1:
+        weekday = sorted(c.high - c.low for c in merged if c.timestamp.weekday() < 5)
+        if weekday:
+            median = weekday[len(weekday) // 2]
+            if median > 0:
+                kept = [c for c in merged if not (c.timestamp.weekday() >= 5
+                                                  and c.high - c.low < _WEEKEND_STUB_FRACTION * median)]
+                stubs = len(merged) - len(kept)
+                merged = kept
+
+    if not duplicates and not stubs:
+        return series
+    log.info("candle_series_cleaned symbol=%s timeframe=%s merged_duplicates=%d "
+             "dropped_weekend_stubs=%d", series.symbol, series.timeframe.value, duplicates, stubs)
+    return CandleSeries(symbol=series.symbol, timeframe=series.timeframe,
+                        provider=series.provider, candles=tuple(merged))
+
+
 class TwelveDataProvider:
     """Twelve Data REST API implementation of :class:`MarketDataProvider`.
 
@@ -404,7 +492,14 @@ class TwelveDataProvider:
         interval = self._INTERVAL_MAP[timeframe]
         data = await self._request(
             "/time_series",
-            {"symbol": self._normalize_symbol(symbol), "interval": interval, "outputsize": limit},
+            # ``timezone=UTC`` makes the labels below true. Without it Twelve
+            # Data answers in the account/exchange zone — measured at about
+            # +9h — while this module stamps every label as UTC. Harmless
+            # while nothing compared a candle with the clock, but outcome
+            # tracking does exactly that, and a 9h error would read
+            # pre-signal price action as if it came after the signal.
+            {"symbol": self._normalize_symbol(symbol), "interval": interval,
+             "outputsize": limit, "timezone": "UTC"},
         )
 
         values = data.get("values")
@@ -414,9 +509,7 @@ class TwelveDataProvider:
         candles: List[Candle] = []
         for row in values:
             try:
-                # Twelve Data timestamps carry no explicit offset; treated as
-                # UTC for internal consistency (documented assumption, not a
-                # guarantee from the API).
+                # Requested in UTC above, so labelling them UTC is accurate.
                 ts = datetime.fromisoformat(row["datetime"]).replace(tzinfo=timezone.utc)
                 candles.append(
                     Candle(

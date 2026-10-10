@@ -39,6 +39,7 @@ from formatter import Formatter
 from market_context import MarketContextBuilder
 from market_data import MarketDataError, MarketDataService
 from models import SignalAnalysis
+from outcome_tracker import OutcomeTracker
 from report import render_telegram_report, render_text as render_report
 from scoring_engine import ScoringEngine
 from signal_parser import ParseResult, parse_signal
@@ -108,6 +109,7 @@ class AnalysisPipeline:
         context_builder: Optional["MarketContextBuilder"] = None,
         trade_decision_engine: Optional["TradeDecisionEngine"] = None,
         emit_reports: bool = True,
+        outcome_tracker: Optional["OutcomeTracker"] = None,
     ) -> None:
         self._settings = settings
         self._queue = queue
@@ -123,6 +125,7 @@ class AnalysisPipeline:
         self._context_builder = context_builder
         self._trade_decision_engine = trade_decision_engine
         self._emit_reports = emit_reports
+        self._outcome_tracker = outcome_tracker
         self._print_lock = asyncio.Lock()
         self._jsonl: TextIO | None = None
         self.stats = Stats()
@@ -245,7 +248,7 @@ class AnalysisPipeline:
     async def _validate_with_market_data(
         self, message: IncomingMessage, analysis: SignalAnalysis
     ) -> tuple[Optional[StructureAnalysis], Optional[SMCAnalysis], object]:
-        """Market-validated path: full context -> risk gate -> ENTER/WAIT/SKIP.
+        """Market-validated path: full context -> risk gate -> ENTER/SKIP.
 
         Used when a ``MarketContextBuilder`` is configured. Builds the
         complete factual picture (multi-timeframe indicators, structure,
@@ -278,6 +281,15 @@ class AnalysisPipeline:
             except Exception:  # noqa: BLE001
                 log.exception("Trade decision failed for message %s", message.id)
 
+        # Record the decision-time snapshot for outcome tracking — every
+        # verdict, SKIP included, before anything is known about
+        # how the trade went. record() never raises; wrapped regardless.
+        if self._outcome_tracker is not None and decision is not None:
+            try:
+                await self._outcome_tracker.record(context, decision, message)
+            except Exception:  # noqa: BLE001 - outcome logging must never break the pipeline
+                log.exception("Outcome recording failed for message %s", message.id)
+
         if self._emit_reports:
             try:
                 await self._emit(render_report(context, decision))
@@ -301,9 +313,11 @@ class AnalysisPipeline:
         if decision is not None:
             log.info(
                 "market_validated_decision message_id=%s symbol=%s verdict=%s "
-                "confidence=%s source=%s risk_approved=%s",
+                "confluence=%s adjusted=%s location=%.2f extension=%.2f source=%s "
+                "risk_approved=%s",
                 message.id, context.symbol, decision.verdict.value,
-                decision.confidence, decision.source.value,
+                decision.confidence, decision.adjusted_score,
+                decision.location_factor, decision.extension_factor, decision.source.value,
                 context.risk.approved if context.risk else None,
             )
 

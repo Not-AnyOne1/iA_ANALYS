@@ -154,9 +154,40 @@ def test_an_unverifiable_setup_scores_low_not_neutral():
 def test_unknown_checks_dilute_the_score():
     full = _validate(_context()).bonus
     ctx = _context()
-    ctx.smc = None
-    ctx.levels = None
+    ctx.timeframes["H1"] = _tf(atr_pct=None, vol="unknown")   # regime unmeasurable
     assert _validate(ctx).bonus < full
+
+
+def test_level_distances_are_reported_but_owned_by_entry_quality():
+    """Room before a level is graded once, in entry_quality, against major
+    levels. The review still finds and reports the nearest swing levels, but
+    they no longer move the score — they fired on almost every signal."""
+    baseline = _validate(_context())
+    ctx = _context()
+    ctx.smc = _smc(liquidity_pools=(_pool(level=100.1),))        # entry on top of a pool
+    ctx.levels = LevelContext(
+        day=None, distance_to_day_high=None, distance_to_day_low=None,
+        nearest_resistance=Distance(level=100.4, absolute=0.4, percent=0.4, atr_multiple=0.2),
+        nearest_support=None, resistance_levels=(100.4,), support_levels=())
+    result = _validate(ctx)
+
+    assert _check(result, "distance_to_resistance").severity is ve.Severity.WEAKNESS
+    assert _check(result, "distance_from_liquidity").severity is ve.Severity.WEAKNESS
+    assert result.adjustment == baseline.adjustment
+
+
+def test_high_volatility_is_a_stop_warning_not_a_score_input():
+    """High volatility contributes nothing to the score — exactly as much as
+    a volatility reading that is not there at all."""
+    high = _context()
+    high.timeframes["H1"] = _tf(vol="high")
+    absent = _context()
+    absent.timeframes["H1"] = _tf(vol="unknown")
+    result = _validate(high)
+    check = _check(result, "volatility")
+    assert check.severity is ve.Severity.NEUTRAL and check.contribution == 0
+    assert "SL risk" in check.detail
+    assert result.adjustment == _validate(absent).adjustment
 
 
 def test_any_fatal_problem_zeroes_the_score():
@@ -213,7 +244,16 @@ def test_a_strong_setup_scores_well():
                                               StructureEventType.CHOCH, 6)))
     result = _validate(ctx)
     assert not result.has_fatal
-    assert result.adjustment >= 10, result.summary
+    assert result.adjustment > 0, result.summary
+    # The SMC evidence is still found and reported as strengths...
+    strengths = {c.name for c in result.strengths}
+    for name in ("liquidity_direction", "bos_alignment", "choch_alignment",
+                 "order_block_quality", "fvg_quality"):
+        assert name in strengths, name
+    # ...but it is credited once, in the base — not a second time here.
+    stripped = _context()
+    stripped.smc = _smc(liquidity_pools=(_pool(level=80.0),))
+    assert result.adjustment == _validate(stripped).adjustment
 
 
 def _sweep_bullish():
@@ -359,10 +399,12 @@ def test_a_demoted_check_is_reported_under_weaknesses(factory, direction, name):
 
 @pytest.mark.parametrize("factory,direction,name", _DEMOTED, ids=_DEMOTED_IDS)
 def test_a_demoted_check_never_forces_skip_on_its_own(factory, direction, name):
-    """No fatal, so the score bands decide — not a veto."""
+    """No fatal, so the threshold decides — not a veto: a maximal direction
+    base still reaches ENTER through the finding."""
+    from trade_decision import ENTER_MIN_SCORE
     result = _validate(factory(), direction=direction)
     assert not result.has_fatal, result.summary
-    assert result.adjustment > -ve.MAX_ADJUSTMENT
+    assert 100 + result.adjustment >= ENTER_MIN_SCORE
 
 
 @pytest.mark.parametrize("factory,direction,name", _DEMOTED, ids=_DEMOTED_IDS)
@@ -655,8 +697,18 @@ def _final(deterministic, positive_weight, negative_weight):
 
 def test_a_strong_score_cannot_outrun_overwhelming_opposition():
     """The reported defect: deterministic 92 with the review 5x against it
-    used to land on 79 (ENTER) because the penalty was capped at 25."""
-    assert _final(92, 0.12 * 106, 0.64 * 106) < 60
+    used to land on 79 because the penalty was capped at 25. The brake now
+    takes 40 points off it (92 -> 52).
+
+    Documented consequence of the single ENTER/SKIP cut at 50: 52 is an
+    ENTER. Under the old 60 threshold it was not. The review is unchanged —
+    only the decision threshold moved — and this assertion is here so that
+    the trade-off stays visible rather than silently accepted.
+    """
+    from trade_decision import ENTER_MIN_SCORE
+    final = _final(92, 0.12 * 106, 0.64 * 106)
+    assert 92 - final >= 40
+    assert final >= ENTER_MIN_SCORE
 
 
 def test_the_response_curve_accelerates_with_opposition():
@@ -729,9 +781,10 @@ def test_the_penalty_does_not_depend_on_the_deterministic_score():
 def test_a_strong_setup_survives_moderate_opposition():
     """The brake must not reject good trades: balanced evidence leaves a
     strong deterministic reading in ENTER, and only marginal ones fall."""
+    from trade_decision import ENTER_MIN_SCORE
     for D in (75, 80, 85, 92, 100):
-        assert _final(D, 0.5 * 106, 0.5 * 106) >= 60, D
-    assert _final(65, 0.5 * 106, 0.5 * 106) < 60      # marginal ENTER -> WAIT
+        assert _final(D, 0.5 * 106, 0.5 * 106) >= ENTER_MIN_SCORE, D
+    assert _final(ENTER_MIN_SCORE + 5, 0.5 * 106, 0.5 * 106) < ENTER_MIN_SCORE   # marginal -> SKIP
 
 
 def test_the_penalty_is_bounded_by_its_budget():
@@ -821,23 +874,111 @@ def test_the_execution_set_is_exactly_the_checks_that_read_the_trade():
     trade_only.spread = 1.0
     assert _validate(trade_only).adjustment == baseline.adjustment
 
-    # Mutating market evidence must move it.
+    # Mutating market evidence the base does not already hold must move it.
     market = _context()
-    market.smc = _smc(liquidity_sweeps=(_sweep_bullish(),))
+    market.timeframes["H1"] = _tf(vol="low")
     assert _validate(market).adjustment != baseline.adjustment
 
 
 def test_every_excluded_check_is_a_known_weight():
     assert ve._CONFIDENCE_EXCLUDED <= set(ve._WEIGHTS)
     assert ve._CONFIDENCE_EXCLUDED == (
-        ve._EXECUTION_CHECKS | ve._NON_TECHNICAL_CHECKS | ve._DUPLICATES_THE_BASE)
+        ve._EXECUTION_CHECKS | ve._NON_TECHNICAL_CHECKS | ve._DUPLICATES_THE_BASE
+        | ve._OWNED_BY_ENTRY_QUALITY)
 
 
-def test_technical_checks_are_the_majority_of_the_evidence():
-    """Confidence must still rest on a broad base after the exclusions."""
+def test_every_exclusion_is_accounted_for():
+    """Nothing is silently dropped. Each excluded check is trade management,
+    non-technical, or a re-reading of something the base already scores —
+    and every one of those base duplicates names a real scoring factor."""
+    from scoring_engine import ScoringEngine
+    factors = set(ScoringEngine()._weights)
+    base_reading = {
+        "bos_alignment": "bos", "choch_alignment": "choch",
+        "order_block_quality": "order_block", "fvg_quality": "fvg",
+        "liquidity_direction": "liquidity_sweep",
+    }
+    assert set(base_reading) | {"probability_score"} == ve._DUPLICATES_THE_BASE
+    assert set(base_reading.values()) <= factors
+
+    technical = {n for n in ve._WEIGHTS if n not in ve._CONFIDENCE_EXCLUDED}
+    grouped = {m for g in ve.VALIDATION_GROUPS for m in g.members} - ve._OWNED_BY_ENTRY_QUALITY
+    assert technical == grouped, "every review check that moves the score is in a group"
+
+
+# ------------------------------------------- evidence groups in the review
+
+def _all_timeframes(trend: str):
+    ctx = _context()
+    for name in ("H4", "D1", "M15"):
+        ctx.timeframes[name] = _tf(trend)
+    ctx.timeframes["H1"] = _tf(ema200=99.0)      # correct side, not extended
+    return ctx
+
+
+def test_timeframe_agreement_earns_no_bonus():
+    """HTF trend, M15 and EMA200 re-measure the directional state the base
+    already counts. Agreeing with it a second time adds nothing."""
+    aligned = _validate(_all_timeframes("bullish"))
+    silent = _all_timeframes("ranging")
+    silent.timeframes["H1"] = _tf(ema200=None)
+    silent = _validate(silent)
+
+    assert _check(aligned, "higher_timeframe_trend").severity is ve.Severity.STRENGTH
+    assert aligned.bonus == silent.bonus
+
+
+def test_timeframe_dissent_still_costs():
+    """A timeframe that contradicts the trade is new information."""
+    aligned = _validate(_all_timeframes("bullish"))
+    against = _validate(_all_timeframes("bearish"))
+    assert against.penalty > aligned.penalty
+    assert against.adjustment < aligned.adjustment
+
+
+def test_a_strong_trend_cannot_inflate_the_review():
+    """Trend + BOS + CHoCH + EMA + HTF all agreeing used to earn most of the
+    review's bonus on top of a base that already counted them. Now the
+    review adds only what the base does not know: regime and levels."""
+    ctx = _all_timeframes("bullish")
+    ctx.structure = _structure(events=(_event(TrendDirection.BULLISH),
+                                       _event(TrendDirection.BULLISH,
+                                              StructureEventType.CHOCH, 6)))
+    ctx.smc = _smc(order_blocks=(_order_block_bullish(),),
+                   fair_value_gaps=(_fvg_bullish(),),
+                   liquidity_sweeps=(_sweep_bullish(),))
+    result = _validate(ctx)
+
+    regime_and_levels = {"atr_condition", "volatility", "distance_to_support",
+                         "distance_to_resistance", "distance_from_liquidity"}
+    total = 12.0 + 5.0                                    # direction, regime
+    most = ve.MAX_ADJUSTMENT * (total - 12.0) / total     # everything but direction
+    assert result.bonus <= round(most)
+    assert {c.name for c in result.strengths} & regime_and_levels
+
+
+def test_regime_checks_count_once():
+    """atr_condition and volatility read the same ATR series: together they
+    are worth one check's weight, not two."""
+    checks = (
+        ve.ValidationCheck("atr_condition", ve.Severity.STRENGTH, 5.0, 5.0, ""),
+        ve.ValidationCheck("volatility", ve.Severity.STRENGTH, 5.0, 5.0, ""),
+        ve.ValidationCheck("rest", ve.Severity.UNKNOWN, 0.0, 15.0, ""),
+    )
+    bonus, _ = ve.ValidationEngine._adjustments(checks)
+    assert bonus == round(ve.MAX_ADJUSTMENT * 5.0 / 20.0)
+
+
+def test_each_review_group_is_worth_its_strongest_member():
+    from evidence_groups import scale_factors
     technical = {n: w for n, w in ve._WEIGHTS.items() if n not in ve._CONFIDENCE_EXCLUDED}
-    assert len(technical) == len(ve._WEIGHTS) - len(ve._CONFIDENCE_EXCLUDED)
-    assert sum(technical.values()) > sum(ve._WEIGHTS.values()) / 2
+    scale = scale_factors(technical, ve.VALIDATION_GROUPS)
+    for group in ve.VALIDATION_GROUPS:
+        members = [m for m in group.members if m in technical]
+        if not members:
+            continue                       # the levels group is owned by entry_quality now
+        worth = sum(technical[m] * scale[m] for m in members)
+        assert worth == pytest.approx(max(technical[m] for m in members)), group.name
 
 
 # ------------------------------------------ confidence is technical-only

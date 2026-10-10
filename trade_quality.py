@@ -25,6 +25,7 @@ from typing import Optional, Sequence
 from levels import LevelContext
 from models import TradeSetup
 from structure_engine import SwingPoint, SwingType
+from trade_geometry import TradeGeometry, check_geometry
 
 
 class Quality(str, Enum):
@@ -70,6 +71,9 @@ class TradeQuality:
     entry_price: Optional[float]
     stop: StopAssessment
     target: TargetAssessment
+    # Whether the levels form a placeable trade at all. Decided first; when
+    # it fails, ``risk_reward`` is None and the risk engine rejects outright.
+    geometry: TradeGeometry = TradeGeometry(False, "incomplete: not assessed")
 
     @property
     def has_complete_levels(self) -> bool:
@@ -207,11 +211,20 @@ def assess(
     swings: Sequence[SwingPoint] = (),
     levels: Optional[LevelContext] = None,
 ) -> TradeQuality:
-    """Full deterministic assessment of a stated setup."""
+    """Full deterministic assessment of a stated setup.
+
+    Geometry is validated against the same effective entry everything else
+    is measured from — the stated entries, or the live price for a market
+    order that states none — so a "BUY NOW" with a stop above the market is
+    caught exactly like an inverted limit order.
+    """
     entry = effective_entry(setup, current_price)
+    entries = list(setup.entries) or ([entry] if entry is not None else [])
+    geometry = check_geometry(setup.direction, entries, setup.stop_loss, setup.take_profits)
     return TradeQuality(
-        risk_reward=setup.risk_reward,   # reuse the existing definition
+        risk_reward=geometry.risk_reward,   # directional; None when invalid
         entry_price=entry,
         stop=assess_stop(setup, entry, atr_value, swings),
         target=assess_target(setup, entry, atr_value, levels),
+        geometry=geometry,
     )

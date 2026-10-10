@@ -30,6 +30,7 @@ from logging_setup import configure_logging
 from market_context import MarketContextBuilder
 from market_data import MarketDataService, TwelveDataProvider
 from news_filter import NewsFilter
+from outcome_tracker import OutcomeTracker
 from pipeline import AnalysisPipeline
 from scoring_engine import ScoringEngine
 from smc_engine import SMCEngine
@@ -325,6 +326,15 @@ async def run_monitor(settings: Settings, formatter: Formatter) -> int:
             "(set TWELVE_DATA_API_KEY to enable live validation)"
         )
 
+    # Phase 9: the evaluation dataset. Needs somewhere to write (storage) and
+    # candles to resolve against (a provider); without either it is simply
+    # off, like every other optional integration here.
+    outcome_tracker: Optional[OutcomeTracker] = None
+    if storage is not None and context_builder is not None:
+        outcome_tracker = OutcomeTracker(storage, market_data)
+        log.info("outcome_tracking_enabled timeframe=M15 interval=%.0fs",
+                 outcome_tracker.interval_seconds)
+
     stop = asyncio.Event()
     _install_signal_handlers(asyncio.get_running_loop(), stop)
 
@@ -361,12 +371,20 @@ async def run_monitor(settings: Settings, formatter: Formatter) -> int:
             market_data=market_data, structure_engine=structure_engine, smc_engine=smc_engine,
             scoring_engine=scoring_engine, decision_engine=decision_engine,
             context_builder=context_builder, trade_decision_engine=trade_decision_engine,
+            outcome_tracker=outcome_tracker,
         ) as pipeline:
             tasks = {
                 asyncio.create_task(pipeline.run(), name="pipeline"),
                 asyncio.create_task(monitor.run_forever(), name="telegram"),
                 asyncio.create_task(stop.wait(), name="shutdown-signal"),
             }
+            # Deliberately NOT in ``tasks``: the wait below ends the program
+            # when any of those finishes, and outcome tracking is background
+            # bookkeeping that must never be able to do that.
+            tracker_task = (
+                asyncio.create_task(outcome_tracker.run_forever(), name="outcome-tracker")
+                if outcome_tracker is not None else None
+            )
             log.info("Listening for new messages — press Ctrl-C to stop")
 
             try:
@@ -390,6 +408,8 @@ async def run_monitor(settings: Settings, formatter: Formatter) -> int:
             await monitor.stop()
             await pipeline.drain()
 
+            if tracker_task is not None:
+                pending = set(pending) | {tracker_task}
             for task in pending:
                 task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

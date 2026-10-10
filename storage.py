@@ -91,7 +91,79 @@ CREATE TABLE IF NOT EXISTS subscribers (
     username TEXT,
     subscribed_at TEXT NOT NULL
 );
+
+-- The evaluation dataset (outcome_tracker.py). One row per analysed signal:
+-- every input to the decision, written at decision time, and the outcome,
+-- written exactly once when the M15 bars that followed decide it.
+CREATE TABLE IF NOT EXISTS signal_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at TEXT NOT NULL,
+    message_id INTEGER,
+    chat_id INTEGER,
+    message_timestamp TEXT,
+    symbol TEXT NOT NULL,
+    analysis_timeframe TEXT,
+    signal_timeframe TEXT,
+    direction TEXT,
+    order_type TEXT,
+    entry REAL,
+    stop_loss REAL,
+    take_profit REAL,
+    take_profits_json TEXT,
+    price_at_decision REAL,
+    risk_reward REAL,
+    decision TEXT,
+    decision_reason TEXT,
+    confluence_score INTEGER,
+    deterministic_score INTEGER,
+    validation_bonus INTEGER,
+    validation_penalty INTEGER,
+    adjusted_score INTEGER,
+    location_factor REAL,
+    extension_factor REAL,
+    range_position REAL,
+    range_low REAL,
+    range_high REAL,
+    extension_atr REAL,
+    extension_percentile REAL,
+    atr REAL,
+    structure_trend TEXT,
+    volatility TEXT,
+    adx REAL,
+    market_regime TEXT,
+    components_json TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    outcome TEXT,
+    filled_at TEXT,
+    resolved_at TEXT,
+    mfe REAL,
+    mae REAL,
+    mfe_r REAL,
+    mae_r REAL,
+    minutes_to_tp REAL,
+    minutes_to_sl REAL,
+    outcome_note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_signal_outcomes_status ON signal_outcomes(status);
 """
+
+# Written once, at decision time.
+_OUTCOME_SNAPSHOT_COLUMNS: Tuple[str, ...] = (
+    "recorded_at", "message_id", "chat_id", "message_timestamp", "symbol",
+    "analysis_timeframe", "signal_timeframe", "direction", "order_type", "entry",
+    "stop_loss", "take_profit", "take_profits_json", "price_at_decision", "risk_reward",
+    "decision", "decision_reason", "confluence_score", "deterministic_score",
+    "validation_bonus", "validation_penalty", "adjusted_score", "location_factor",
+    "extension_factor", "range_position", "range_low", "range_high", "extension_atr",
+    "extension_percentile", "atr", "structure_trend", "volatility", "adx",
+    "market_regime", "components_json", "status", "outcome_note",
+)
+
+# Written once, when the outcome is decided — and only onto an open row.
+_OUTCOME_RESOLUTION_COLUMNS: Tuple[str, ...] = (
+    "status", "outcome", "filled_at", "resolved_at", "mfe", "mae", "mfe_r", "mae_r",
+    "minutes_to_tp", "minutes_to_sl", "outcome_note",
+)
 
 # RFC-009: additive columns, all nullable. Added via ALTER TABLE (guarded by
 # a PRAGMA table_info check) rather than baked into _SCHEMA's CREATE TABLE,
@@ -403,6 +475,86 @@ class Storage:
         try:
             return [int(row[0]) for row in conn.execute(
                 "SELECT chat_id FROM subscribers ORDER BY subscribed_at, chat_id")]
+        finally:
+            conn.close()
+
+    # -------------------------------------------------------- signal outcomes
+
+    async def record_signal_outcome(self, row: Dict[str, object]) -> Optional[int]:
+        """Insert one decision-time snapshot; the new row id. Never raises.
+
+        Unknown keys are ignored and missing ones stored as NULL, so the
+        snapshot can grow without breaking an older database file.
+        """
+        for attempt in range(1, _LOCK_RETRIES + 1):
+            try:
+                return await asyncio.to_thread(self._record_signal_outcome_sync, row)
+            except Exception as exc:  # noqa: BLE001 - must never break the pipeline
+                if self._is_locked_error(exc) and attempt < _LOCK_RETRIES:
+                    await asyncio.sleep(_LOCK_RETRY_DELAY * attempt)
+                    continue
+                log.error("signal_outcome_record_failed symbol=%s attempts=%d",
+                          row.get("symbol"), attempt, exc_info=True)
+                return None
+        return None
+
+    def _record_signal_outcome_sync(self, row: Dict[str, object]) -> int:
+        columns = _OUTCOME_SNAPSHOT_COLUMNS
+        conn = self._connect()
+        try:
+            with conn:
+                cur = conn.execute(
+                    f"INSERT INTO signal_outcomes ({', '.join(columns)}) "
+                    f"VALUES ({', '.join('?' for _ in columns)})",
+                    tuple(row.get(c) for c in columns),
+                )
+            return int(cur.lastrowid)
+        finally:
+            conn.close()
+
+    async def open_signal_outcomes(self) -> List[Dict[str, object]]:
+        """Every tracked signal whose outcome is not decided yet, oldest first."""
+        return await asyncio.to_thread(self._signal_outcomes_sync, "open")
+
+    async def fetch_signal_outcomes(self) -> List[Dict[str, object]]:
+        """The whole evaluation dataset, oldest first."""
+        return await asyncio.to_thread(self._signal_outcomes_sync, None)
+
+    def _signal_outcomes_sync(self, status: Optional[str]) -> List[Dict[str, object]]:
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            query = "SELECT * FROM signal_outcomes"
+            params: Tuple[object, ...] = ()
+            if status is not None:
+                query += " WHERE status = ?"
+                params = (status,)
+            return [dict(r) for r in conn.execute(query + " ORDER BY id", params)]
+        finally:
+            conn.close()
+
+    async def resolve_signal_outcome(self, outcome_id: int, resolution: Dict[str, object]) -> bool:
+        """Write an outcome onto an OPEN row. True if this call resolved it.
+
+        The ``status = 'open'`` condition is the guarantee that history is
+        never rewritten: a resolved row matches nothing, so a second
+        resolution — or any later attempt to change one — is a no-op.
+        """
+        if resolution.get("status") in (None, "open"):
+            raise ValueError("a resolution must close the row")
+        return await asyncio.to_thread(self._resolve_signal_outcome_sync, outcome_id, resolution)
+
+    def _resolve_signal_outcome_sync(self, outcome_id: int, resolution: Dict[str, object]) -> bool:
+        columns = _OUTCOME_RESOLUTION_COLUMNS
+        conn = self._connect()
+        try:
+            with conn:
+                cur = conn.execute(
+                    f"UPDATE signal_outcomes SET {', '.join(f'{c} = ?' for c in columns)} "
+                    f"WHERE id = ? AND status = 'open'",
+                    tuple(resolution.get(c) for c in columns) + (outcome_id,),
+                )
+            return cur.rowcount == 1
         finally:
             conn.close()
 

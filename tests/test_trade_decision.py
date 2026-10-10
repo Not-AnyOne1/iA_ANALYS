@@ -74,14 +74,32 @@ def _risk(approved: bool = True) -> RiskAssessment:
     return RiskAssessment(approved=approved, checks=checks)
 
 
+def _entry(location: float = 1.0, extension: float = 1.0):
+    """An entry assessment with the given factors. 1.0 / 1.0 is a clean
+    entry: favourable location, normal-sized move."""
+    from entry_quality import EntryQuality, ExtensionAssessment, LocationAssessment
+    loc_label = "favourable" if location == 1.0 else "unfavourable"
+    ext_label = "normal" if extension == 1.0 else "strong"
+    return EntryQuality(
+        location=LocationAssessment(location, loc_label, "lower" if location == 1.0 else "upper",
+                                    0.2 if location == 1.0 else 1.0, None, 95.0, 105.0,
+                                    f"buying in the {loc_label} part of the range"),
+        extension=ExtensionAssessment(extension, ext_label, 0.5, 0.3 if extension == 1.0 else 0.99,
+                                      14, 186, f"move is {ext_label}"),
+    )
+
+
 def _context(*, usable: bool = True, approved: bool = True,
              confidence: int = 70, bonus: int = 5, penalty: int = 0,
-             validation: bool = True, fatal: bool = False) -> MarketContext:
+             validation: bool = True, fatal: bool = False,
+             location: float = 1.0, extension: float = 1.0) -> MarketContext:
     """A context that decides ENTER by default.
 
-    ``confidence`` is the deterministic score — the ONE confidence. ``bonus``
+    ``confidence`` is the deterministic score — the direction base. ``bonus``
     and ``penalty`` are the review's adjustments to it, so the adjusted score
-    is ``confidence + bonus - penalty``.
+    is ``confidence + bonus - penalty``; ``location`` and ``extension`` are
+    the entry factors that scale it into the confluence score. The defaults
+    describe a clean entry, so confluence equals the adjusted score.
     """
     ctx = MarketContext(symbol="XAUUSD", generated_at=datetime(2026, 5, 1, 14, tzinfo=timezone.utc),
                         primary_timeframe=Timeframe.H1)
@@ -91,6 +109,7 @@ def _context(*, usable: bool = True, approved: bool = True,
     ctx.spread = 0.2
     ctx.scoring = _scoring(confidence)
     ctx.risk = _risk(approved)
+    ctx.entry = _entry(location, extension)
     if validation:
         ctx.validation = _validation(bonus=bonus, penalty=penalty, fatal=fatal)
     return ctx
@@ -185,9 +204,9 @@ def test_risk_rejection_caps_the_verdict_at_skip():
 
 
 def test_an_objective_blocker_reaches_the_decision_by_exactly_one_route():
-    """Regression: news blackout used to be a validation FATAL (-> SKIP) and
-    a risk REJECT (-> WAIT) at once, so the outcome depended on which branch
-    ran first. Only the risk engine blocks now."""
+    """Regression: news blackout used to be a validation FATAL and a risk
+    REJECT at once, each with a different consequence, so the outcome
+    depended on which branch ran first. Only the risk engine blocks now."""
     engine = TradeDecisionEngine(_settings())
     engine._run_cli = AsyncMock(return_value=(0, _envelope(), ""))
 
@@ -454,7 +473,7 @@ def test_facts_give_claude_the_review_and_the_decision_to_explain():
     assert decision["deterministic_score"] == 70
     assert decision["adjusted_score"] == 76
     assert decision["arithmetic"] == "70 + 9 - 3 = 76"
-    assert decision["bands"] == {"skip": "0-39", "wait": "40-59", "enter": "60-100"}
+    assert decision["bands"] == {"skip": "0-49", "enter": "50-100"}
 
 
 def test_report_shows_the_validation_section():
@@ -506,16 +525,15 @@ def test_the_report_shows_no_second_confidence():
 
 @pytest.mark.parametrize("adjusted,expected", [
     (100, Action.ENTER),
-    (61, Action.ENTER),
-    (60, Action.ENTER),    # boundary: >= 60 enters
-    (59, Action.WAIT),     # boundary: 40-59 waits
-    (50, Action.WAIT),
-    (40, Action.WAIT),     # boundary: >= 40 waits
-    (39, Action.SKIP),     # boundary: < 40 skips
+    (60, Action.ENTER),
+    (51, Action.ENTER),
+    (50, Action.ENTER),    # boundary: >= 50 enters
+    (49, Action.SKIP),     # boundary: < 50 skips
+    (40, Action.SKIP),     # what used to be WAIT is now SKIP
     (10, Action.SKIP),
     (0, Action.SKIP),
 ])
-def test_the_bands_decide(adjusted, expected):
+def test_the_threshold_decides(adjusted, expected):
     engine = TradeDecisionEngine(_settings())
     engine._run_cli = AsyncMock(return_value=(0, _envelope(), ""))
 
@@ -525,17 +543,26 @@ def test_the_bands_decide(adjusted, expected):
     assert result.adjusted_score == adjusted
 
 
-def test_the_review_can_move_a_verdict_across_a_band():
+def test_there_are_only_two_verdicts():
+    """WAIT is gone completely — from the enum, the bands and every score."""
+    from trade_decision import decide_deterministically
+    assert {a.value for a in Action} == {"enter", "skip"}
+    for score in range(0, 101):
+        verdict = decide_deterministically(_context(confidence=score, bonus=0)).verdict
+        assert verdict is (Action.ENTER if score >= 50 else Action.SKIP), score
+
+
+def test_the_review_can_move_a_verdict_across_the_threshold():
     """A middling conviction with an excellent review reaches ENTER; a strong
     one with a damning review does not."""
     engine = TradeDecisionEngine(_settings())
     engine._run_cli = AsyncMock(return_value=(0, _envelope(), ""))
 
-    lifted = asyncio.run(engine.decide(_context(confidence=50, bonus=15, penalty=0)))
+    lifted = asyncio.run(engine.decide(_context(confidence=40, bonus=15, penalty=0)))
     sunk = asyncio.run(engine.decide(_context(confidence=65, bonus=0, penalty=20)))
 
-    assert lifted.verdict is Action.ENTER and lifted.confidence == 65
-    assert sunk.verdict is Action.WAIT and sunk.confidence == 45
+    assert lifted.verdict is Action.ENTER and lifted.confidence == 55
+    assert sunk.verdict is Action.SKIP and sunk.confidence == 45
 
 
 def test_the_review_can_never_manufacture_a_verdict_on_its_own():
@@ -547,11 +574,11 @@ def test_the_review_can_never_manufacture_a_verdict_on_its_own():
     best = asyncio.run(engine.decide(_context(confidence=0, bonus=MAX_ADJUSTMENT)))
     worst = asyncio.run(engine.decide(_context(confidence=100, penalty=MAX_ADJUSTMENT, bonus=0)))
 
-    assert best.verdict is Action.SKIP     # 0 + 25 = 25, still below 40
-    assert worst.verdict is Action.ENTER   # 100 - 25 = 75, still at or above 60
+    assert best.verdict is Action.SKIP     # 0 + 25 = 25, still below 50
+    assert worst.verdict is Action.ENTER   # 100 - 25 = 75, still at or above 50
 
 
-@pytest.mark.parametrize("score", [60, 75, 100])
+@pytest.mark.parametrize("score", [50, 75, 100])
 def test_a_risk_rejection_skips_at_every_score(score):
     engine = TradeDecisionEngine(_settings())
     engine._run_cli = AsyncMock(return_value=(0, _envelope(), ""))
@@ -563,7 +590,7 @@ def test_a_risk_rejection_skips_at_every_score(score):
     assert rejected.verdict is Action.SKIP
 
 
-@pytest.mark.parametrize("score", [0, 39, 40, 59, 60, 100])
+@pytest.mark.parametrize("score", [0, 49, 50, 100])
 def test_a_fatal_problem_forces_skip_at_every_score(score):
     engine = TradeDecisionEngine(_settings())
     engine._run_cli = AsyncMock(return_value=(0, _envelope(), ""))
@@ -596,10 +623,10 @@ def test_claude_is_consulted_even_when_the_verdict_is_skip():
     engine._run_cli.assert_awaited_once()
 
 
-def test_thresholds_are_named_constants():
-    from trade_decision import ENTER_MIN_SCORE, WAIT_MIN_SCORE
-    assert ENTER_MIN_SCORE == 60
-    assert WAIT_MIN_SCORE == 40
+def test_the_threshold_is_a_named_constant():
+    import trade_decision
+    assert trade_decision.ENTER_MIN_SCORE == 50
+    assert not hasattr(trade_decision, "WAIT_MIN_SCORE")
 
 
 def test_there_is_exactly_one_confidence_on_the_decision():
@@ -697,6 +724,192 @@ def test_a_dead_tie_has_no_confidence_either_way():
                         direction=ScoreDirection.NONE, confidence=0, net_score=0.0,
                         total_possible=106.0, breakdown=(), reasons=())
     assert directional_confidence(tie, "long") == directional_confidence(tie, "short") == 0
+
+
+# ------------------------------------------- direction vs entry quality
+
+def test_high_direction_with_a_poor_entry_does_not_enter():
+    """Acceptance #7: perfect direction at the top of the range after an
+    outsized run is a late entry. 100 x 0.5 x 0.5 = 25 — SKIP."""
+    from trade_decision import decide_deterministically
+    trace = decide_deterministically(_context(confidence=100, bonus=0, location=0.5, extension=0.5))
+
+    assert trace.adjusted_score == 100
+    assert trace.confluence_score == 25
+    assert trace.verdict is Action.SKIP
+    assert "entry is poor" in trace.reason
+
+
+@pytest.mark.parametrize("location,extension,expected", [
+    (1.0, 1.0, Action.ENTER),     # clean entry: direction carries it
+    (0.75, 1.0, Action.ENTER),    # 90 x 0.75 = 68
+    (0.75, 0.75, Action.ENTER),   # 90 x 0.5625 = 51
+    (0.5, 1.0, Action.SKIP),      # 90 x 0.5 = 45
+    (0.5, 0.6, Action.SKIP),      # 90 x 0.3 = 27
+])
+def test_entry_quality_moves_a_strong_direction_across_the_threshold(location, extension, expected):
+    from trade_decision import decide_deterministically
+    trace = decide_deterministically(_context(confidence=90, bonus=0,
+                                              location=location, extension=extension))
+    assert trace.adjusted_score == 90
+    assert trace.verdict is expected, trace.reason
+
+
+def test_a_good_entry_never_raises_the_score():
+    from trade_decision import decide_deterministically
+    for score in (0, 49, 50, 100):
+        trace = decide_deterministically(_context(confidence=score, bonus=0))
+        assert trace.confluence_score == trace.adjusted_score
+
+
+# ------------------------------------------------ SL risk: a warning, never a gate
+
+def _with_stop(ctx, *, stop_atr: float, mae: str = "unknown"):
+    """Attach a stop ``stop_atr`` ATR from entry (R:R held at 3) and a
+    max-adverse-excursion finding of the given grade."""
+    import validation_engine as ve
+    from models import TradeSetup
+    from trade_quality import assess
+    risk = stop_atr * 2.0
+    ctx.setup = TradeSetup(symbol="XAUUSD", direction="long", order_type="limit",
+                           entries=[100.0], stop_loss=100.0 - risk,
+                           take_profits=[100.0 + 3 * risk])
+    ctx.quality = assess(ctx.setup, current_price=100.0, atr_value=2.0)
+    finding = {
+        "high": ve._check("max_adverse_excursion", ve.Severity.WEAKNESS, "inside the heat", ratio=1.0),
+        "medium": ve._check("max_adverse_excursion", ve.Severity.WEAKNESS, "barely clears", ratio=0.5),
+        "low": ve._check("max_adverse_excursion", ve.Severity.STRENGTH, "comfortably clears"),
+        "unknown": ve._check("max_adverse_excursion", ve.Severity.UNKNOWN, "no history"),
+    }[mae]
+    ctx.validation = ve.ValidationResult(bonus=ctx.validation.bonus, penalty=ctx.validation.penalty,
+                                         checks=ctx.validation.checks + (finding,))
+    return ctx
+
+
+@pytest.mark.parametrize("stop_atr,mae,expected", [
+    (2.0, "low", "LOW"),          # good stop that clears the typical heat
+    (2.0, "medium", "MEDIUM"),    # barely clears the heat
+    (2.0, "high", "HIGH"),        # inside the heat
+    (0.7, "low", "MEDIUM"),       # acceptable but tight stop
+    (0.3, "low", "HIGH"),         # inside the noise band
+    (6.0, "low", "HIGH"),         # unusually wide
+    (2.0, "unknown", "LOW"),      # one source is enough
+])
+def test_sl_risk_grades_the_stop(stop_atr, mae, expected):
+    from trade_decision import stop_loss_risk
+    sl = stop_loss_risk(_with_stop(_context(), stop_atr=stop_atr, mae=mae))
+    assert sl.level.value == expected
+    assert sl.reasons
+
+
+def test_sl_risk_is_unknown_without_a_stop_assessment():
+    from trade_decision import stop_loss_risk
+    assert stop_loss_risk(_context()).level.value == "UNKNOWN"
+
+
+@pytest.mark.parametrize("confidence", [30, 49, 50, 80])
+def test_sl_risk_never_changes_the_decision(confidence):
+    """Same market, same R:R, stops from razor-thin to very wide and from
+    LOW to HIGH risk: the verdict and every number behind it are identical."""
+    from trade_decision import decide_deterministically, stop_loss_risk
+    traces, levels = [], set()
+    for stop_atr, mae in ((2.0, "low"), (2.0, "high"), (0.3, "medium"), (6.0, "high")):
+        ctx = _with_stop(_context(confidence=confidence, bonus=0), stop_atr=stop_atr, mae=mae)
+        traces.append(decide_deterministically(ctx))
+        levels.add(stop_loss_risk(ctx).level)
+    assert len(levels) > 1                                  # the warning did vary...
+    assert len({(t.verdict, t.confluence_score, t.reason) for t in traces}) == 1   # ...the decision did not
+
+
+def test_the_decision_carries_the_sl_warning():
+    engine = TradeDecisionEngine(_settings())
+    engine._run_cli = AsyncMock(return_value=(0, _envelope(), ""))
+    ctx = _with_stop(_context(confidence=80), stop_atr=0.3, mae="high")
+    result = asyncio.run(engine.decide(ctx))
+
+    assert result.verdict is Action.ENTER                   # HIGH SL risk, still ENTER
+    assert result.sl_risk == "HIGH"
+    assert result.sl_risk_reasons
+    facts = build_facts(ctx)
+    assert facts["sl_risk"]["level"] == "HIGH"
+    assert "did not affect the verdict" in facts["sl_risk"]["note"]
+
+
+def test_the_card_shows_the_sl_risk_next_to_the_stop():
+    engine = TradeDecisionEngine(_settings())
+    engine._run_cli = AsyncMock(return_value=(0, _envelope(), ""))
+    ctx = _with_stop(_context(confidence=80), stop_atr=0.3, mae="high")
+    card = report_mod.render_telegram_report(ctx, asyncio.run(engine.decide(ctx)))
+
+    sl_line = next(line for line in card.splitlines() if "SL:" in line)
+    assert "SL risk: HIGH" in sl_line
+    assert "SL risk HIGH" in card.split("Summary:")[1]       # with the reason to adjust it
+    assert len(card.splitlines()) <= 20
+    assert "WAIT" not in card
+
+
+def test_the_text_report_shows_the_sl_warning_and_two_bands():
+    engine = TradeDecisionEngine(_settings())
+    engine._run_cli = AsyncMock(return_value=(0, _envelope(), ""))
+    ctx = _with_stop(_context(confidence=80), stop_atr=2.0, mae="medium")
+    text = report_mod.render_text(ctx, asyncio.run(engine.decide(ctx)))
+
+    assert "SL risk            MEDIUM" in text
+    assert "not part of the decision" in text
+    assert "SKIP 0-49   ENTER 50-100" in text
+    assert "WAIT" not in text
+
+
+def test_a_missing_entry_assessment_skips():
+    """Unmeasured is not acceptable — same rule as scoring, review and risk."""
+    from trade_decision import decide_deterministically
+    ctx = _context(confidence=95)
+    ctx.entry = None
+    trace = decide_deterministically(ctx)
+    assert trace.verdict is Action.SKIP
+    assert "entry-quality" in trace.reason
+
+
+def test_the_score_is_bounded_and_finite_everywhere():
+    import math
+    from trade_decision import decide_deterministically
+    for score in (0, 20, 50, 80, 100):
+        for bonus, penalty in ((0, 0), (25, 0), (0, 80), (25, 80)):
+            for loc in (0.5, 0.75, 1.0):
+                for ext in (0.5, 0.8, 1.0):
+                    trace = decide_deterministically(_context(
+                        confidence=score, bonus=bonus, penalty=penalty,
+                        location=loc, extension=ext))
+                    assert 0 <= trace.confluence_score <= 100
+                    assert math.isfinite(trace.confluence_score)
+
+
+def test_the_decision_carries_the_whole_calculation():
+    engine = TradeDecisionEngine(_settings())
+    engine._run_cli = AsyncMock(return_value=(0, _envelope(), ""))
+    result = asyncio.run(engine.decide(_context(confidence=80, bonus=4, penalty=2,
+                                                location=0.75, extension=0.8)))
+
+    assert result.adjusted_score == 82
+    assert result.location_factor == 0.75 and result.extension_factor == 0.8
+    assert result.confluence_score == round(82 * 0.75 * 0.8) == result.confidence
+    assert result.entry_findings                     # location and extension, in words
+
+    text = report_mod.render_text(_context(confidence=80, bonus=4, penalty=2,
+                                           location=0.75, extension=0.8), result)
+    assert "x location factor" in text and "x extension factor" in text
+    assert "= confluence score" in text
+    assert "NOT a win probability" in text
+
+
+def test_facts_tell_claude_the_score_is_not_a_probability():
+    facts = build_facts(_context(location=0.5, extension=1.0))
+    assert "not a probability" in facts["decision"]["score_meaning"]
+    assert facts["decision"]["confluence_arithmetic"].endswith(
+        f"= {facts['decision']['confluence_score']}")
+    assert facts["entry_quality"]["location"]["factor"] == 0.5
+    from trade_decision import SYSTEM_PROMPT
+    assert "NOT a probability" in SYSTEM_PROMPT
 
 
 def test_the_report_and_telegram_card_show_the_directional_number():

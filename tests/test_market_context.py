@@ -356,15 +356,14 @@ def test_full_pipeline_telegram_to_report(tmp_path, monkeypatch):
     assert len(rows) == 1
     row = rows[0]
     assert row.symbol == "XAUUSD"
-    # ENTER/WAIT/SKIP, not BUY/SELL. Claude asked for "wait", but this
-    # straight-line synthetic series has no swing structure so it validates
-    # at 12/100 — below the 40 threshold — and the band caps it at SKIP.
+    # ENTER/SKIP, not BUY/SELL. The stub envelope still carries a legacy
+    # "wait" field, but Claude has no verdict channel: this straight-line
+    # synthetic series has no swing structure, so its confluence is far below
+    # the 50 threshold and the verdict is SKIP.
     assert row.decision_verdict == "skip"
     assert row.decision_source == "claude"     # the model really was consulted
-    # The persisted confidence is the ONE confidence: the deterministic score
-    # plus the review's bonus, minus its penalty. This structureless
-    # straight-line series scores near zero and the review can only nudge it,
-    # so it lands far below the 40 band and the verdict is SKIP.
+    # The persisted score is the ONE score — the confluence score. This
+    # structureless series scores near zero and the review can only nudge it.
     assert row.decision_confidence < 40
     assert row.structure_trend is not None
     assert row.timeframe == "H1"
@@ -394,8 +393,8 @@ def test_the_deterministic_bands_cap_the_stored_verdict(tmp_path, monkeypatch):
     findings get explained) but its verdict is capped by the validation
     score band — it cannot argue its way past the rules.
 
-    This fixture validates at 12/100, below the 40 threshold, so the stored
-    verdict is SKIP no matter what the model asks for."""
+    This fixture scores far below the 50 threshold, so the stored verdict is
+    SKIP no matter what the model asks for."""
     import shutil
     from unittest.mock import AsyncMock
     from datetime import datetime as dt

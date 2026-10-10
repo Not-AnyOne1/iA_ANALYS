@@ -33,14 +33,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import entry_quality
 import indicators
 import levels as levels_mod
 import trade_quality
-from market_data import Candle, CandleSeries, MarketDataError, MarketDataService, Quote, Timeframe
+from market_data import (
+    Candle, CandleSeries, MarketDataError, MarketDataService, Quote, Timeframe, closed_candles,
+)
 from models import TradeSetup
 from news_filter import NewsFilter, NewsStatus
 from risk_engine import RiskAssessment, RiskSettings, evaluate as evaluate_risk
@@ -116,6 +119,11 @@ class MarketContext:
     quality: Optional[trade_quality.TradeQuality] = None
     risk: Optional[RiskAssessment] = None
 
+    # Is this a good trade from THIS price? Location in the dealing range and
+    # extension of the move so far (entry_quality.py). ``None`` means the
+    # assessment did not run, which the decision treats as unmeasured.
+    entry: Optional[entry_quality.EntryQuality] = None
+
     # The skeptical challenge (validation_engine.py). Populated last,
     # because it reasons over everything above.
     validation: Optional[ValidationResult] = None
@@ -126,6 +134,15 @@ class MarketContext:
     # and never serialises this, which is what keeps "Claude cannot compute
     # an indicator" true — there is no series in its input to compute from.
     primary_candles: Tuple[Candle, ...] = ()
+
+    # Open time of the last CLOSED bar each timeframe was analysed through.
+    # Everything structural is computed from closed bars only; recording
+    # where each series stopped makes every decision replayable exactly.
+    closed_through: Dict[str, datetime] = field(default_factory=dict)
+
+    # Major levels price must clear on the way to a target — multi-touch
+    # liquidity, unswept H4 swings, previous-day high/low — as (price, label).
+    major_levels: List[Tuple[float, str]] = field(default_factory=list)
 
     # Anything that could not be computed, and why.
     warnings: List[str] = field(default_factory=list)
@@ -180,12 +197,18 @@ class MarketContextBuilder:
         if self._primary not in self._timeframes:
             self._timeframes = (self._primary, *self._timeframes)
 
-    async def build(self, symbol: str, setup: Optional[TradeSetup] = None) -> MarketContext:
-        """Assemble every fact available for ``symbol``. Never raises."""
+    async def build(self, symbol: str, setup: Optional[TradeSetup] = None, *,
+                    now: Optional[datetime] = None) -> MarketContext:
+        """Assemble every fact available for ``symbol``. Never raises.
+
+        ``now`` is the decision time; it defaults to the clock. It decides
+        which bars count as closed, so passing a past time replays a
+        decision exactly as it would have been made then.
+        """
         symbol = symbol.strip().upper()
         ctx = MarketContext(
             symbol=symbol,
-            generated_at=datetime.now(timezone.utc),
+            generated_at=now or datetime.now(timezone.utc),
             primary_timeframe=self._primary,
         )
 
@@ -194,6 +217,7 @@ class MarketContextBuilder:
         self._add_timeframe_analysis(ctx, series_by_tf)
         self._add_structure_and_smc(ctx, series_by_tf)
         self._add_levels(ctx, series_by_tf)
+        self._add_major_levels(ctx, series_by_tf)
         ctx.session = session_info(ctx.generated_at)
         ctx.news = self._news.check(symbol, ctx.generated_at)
         primary_series = series_by_tf.get(self._primary)
@@ -202,8 +226,88 @@ class MarketContextBuilder:
         ctx.setup = setup
         if setup is not None:
             self._add_quality_and_risk(ctx, setup)
+            self._add_entry_quality(ctx, setup)
         self._add_validation(ctx, setup)
         return ctx
+
+    def _add_entry_quality(self, ctx: MarketContext, setup: TradeSetup) -> None:
+        """Where the entry sits in the dealing range, and how far price has run.
+
+        The dealing range is the SMC one — latest confirmed swing high and
+        low, whose midpoint smc_engine already uses as equilibrium — so this
+        introduces no second definition of a range. Measured from the
+        effective entry (the stated entry, or the live price for a market
+        order), because the question is whether *that* price is a good one.
+        """
+        smc = ctx.smc
+        low = smc.discount_zone.price_low if smc and smc.discount_zone else None
+        high = smc.premium_zone.price_high if smc and smc.premium_zone else None
+        entry = trade_quality.effective_entry(setup, ctx.current_price)
+        try:
+            ctx.entry = entry_quality.assess(
+                setup.direction, entry, low, high, ctx.primary_candles,
+                current_price=ctx.current_price, targets=setup.take_profits,
+                levels=ctx.major_levels, atr=ctx.primary.atr if ctx.primary else None,
+            )
+        except Exception as exc:  # noqa: BLE001 - must not cost the rest of the analysis
+            ctx.warnings.append(f"entry quality failed: {type(exc).__name__}: {exc}")
+            log.exception("entry_quality_failed symbol=%s", ctx.symbol)
+
+    def _add_major_levels(
+        self, ctx: MarketContext, series_by_tf: Dict[Timeframe, CandleSeries]
+    ) -> None:
+        """Levels a trade has to clear on its way to a target — the major ones.
+
+        Three kinds, all from closed bars, each a level traders watch for a
+        reason rather than any swing that happens to sit in the way:
+
+        * **multi-touch liquidity** — H1 equal highs and equal lows (two or
+          more swings at one price) that price has not traded through since;
+        * **unswept H4 swings** — higher-timeframe highs and lows not yet
+          exceeded;
+        * **previous day high/low** — from the last closed daily bar.
+
+        A failure here leaves the list empty: room is then graded "clear",
+        and a warning says why.
+        """
+        levels: List[Tuple[float, str]] = []
+        try:
+            primary = series_by_tf.get(self._primary)
+            if ctx.smc is not None and primary is not None:
+                highs = [c.high for c in primary.candles]
+                lows = [c.low for c in primary.candles]
+                for eq in ctx.smc.equal_highs:
+                    top = max(s.price for s in eq.swing_points)
+                    last = max(s.index for s in eq.swing_points)
+                    if all(h <= top for h in highs[last + 1:]):
+                        levels.append((top, "equal highs"))
+                for eq in ctx.smc.equal_lows:
+                    bottom = min(s.price for s in eq.swing_points)
+                    last = max(s.index for s in eq.swing_points)
+                    if all(lo >= bottom for lo in lows[last + 1:]):
+                        levels.append((bottom, "equal lows"))
+
+            h4 = series_by_tf.get(Timeframe.H4)
+            if h4 is not None:
+                highs = [c.high for c in h4.candles]
+                lows = [c.low for c in h4.candles]
+                for swing in self._structure.analyze(h4).swing_points:
+                    later = slice(swing.index + 1, None)
+                    if swing.type.value == "high" and all(h <= swing.price for h in highs[later]):
+                        levels.append((swing.price, "H4 swing high"))
+                    elif swing.type.value == "low" and all(lo >= swing.price for lo in lows[later]):
+                        levels.append((swing.price, "H4 swing low"))
+
+            d1 = series_by_tf.get(Timeframe.D1)
+            if d1 is not None and d1.candles:
+                previous_day = d1.candles[-1]
+                levels.append((previous_day.high, "previous day high"))
+                levels.append((previous_day.low, "previous day low"))
+        except Exception as exc:  # noqa: BLE001 - must not cost the rest of the analysis
+            ctx.warnings.append(f"major levels failed: {type(exc).__name__}: {exc}")
+            log.exception("major_levels_failed symbol=%s", ctx.symbol)
+            levels = []
+        ctx.major_levels = levels
 
     def _add_validation(self, ctx: MarketContext, setup: Optional[TradeSetup]) -> None:
         """Run the skeptical challenge over everything computed above.
@@ -255,8 +359,18 @@ class MarketContextBuilder:
         for tf, outcome in results:
             if isinstance(outcome, MarketDataError):
                 ctx.warnings.append(f"{tf.value} candles unavailable: {outcome}")
-            else:
-                series[tf] = outcome
+                continue
+            # Closed bars only. The provider's last bar is usually still
+            # forming; a BOS, a sweep or an indicator read off it is
+            # provisional and was measured to flip live verdicts. The live
+            # price still reaches the decision — through the entry, the
+            # location, R:R and the latest move — never through structure.
+            closed = closed_candles(outcome.candles, tf, ctx.generated_at)
+            if not closed:
+                ctx.warnings.append(f"{tf.value} candles unavailable: no closed bar yet")
+                continue
+            series[tf] = replace(outcome, candles=closed)
+            ctx.closed_through[tf.value] = closed[-1].timestamp
         return series
 
     # ------------------------------------------------------------ computing
@@ -297,7 +411,10 @@ class MarketContextBuilder:
         try:
             ctx.structure = self._structure.analyze(series)
             ctx.smc = self._smc.analyze(series, ctx.structure)
-            ctx.scoring = self._scoring.score(ctx.structure, ctx.smc)
+            # ``last_index`` lets the scoring engine weigh each structure
+            # event by how recently it happened.
+            ctx.scoring = self._scoring.score(ctx.structure, ctx.smc,
+                                              last_index=len(series.candles) - 1)
         except Exception as exc:  # noqa: BLE001
             ctx.warnings.append(f"structure/SMC/scoring failed: {type(exc).__name__}: {exc}")
             log.exception("structure_smc_failed symbol=%s", ctx.symbol)

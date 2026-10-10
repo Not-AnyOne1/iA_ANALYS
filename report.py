@@ -10,7 +10,7 @@ same text:
 - :func:`render_text` — the full desk report, for the terminal and the logs.
   Every section, every number, monospace tables.
 - :func:`render_telegram_report` — a short card for the phone: instrument,
-  side, verdict, confidence, levels, and a few lines of why. At most 20
+  side, verdict, confluence score, levels, and a few lines of why. At most 20
   lines. It is not a trimmed copy of the desk report; a wall of tables is
   unreadable on mobile and burying the verdict in it helps nobody.
 
@@ -27,9 +27,10 @@ from typing import Optional
 from market_context import MarketContext
 from trade_decision import (
     ENTER_MIN_SCORE as report_enter_min,
-    WAIT_MIN_SCORE as report_wait_min,
     Action,
+    SLRisk,
     TradeDecision,
+    stop_loss_risk,
 )
 
 _DASH = "—"
@@ -65,7 +66,7 @@ def _yesno(value: Optional[bool]) -> str:
 
 
 def _verdict_marker(verdict: Action) -> str:
-    return {Action.ENTER: "[ENTER]", Action.WAIT: "[WAIT]", Action.SKIP: "[SKIP]"}[verdict]
+    return {Action.ENTER: "[ENTER]", Action.SKIP: "[SKIP]"}[verdict]
 
 
 def render_text(context: MarketContext, decision: Optional[TradeDecision] = None) -> str:
@@ -201,16 +202,39 @@ def render_text(context: MarketContext, decision: Optional[TradeDecision] = None
                      f"  ({_num(q.target.atr_multiple)} ATR)")
         for reason in q.target.reasons:
             lines.append(f"                     - {reason}")
+        sl = stop_loss_risk(ctx)
+        lines.append(f"  SL risk            {sl.level.value}"
+                     f"   (warning only — adjust the stop by hand; it does not change the decision)")
+        for reason in sl.reasons:
+            lines.append(f"                     - {reason}")
     else:
         lines.append(f"  {_DASH} (no setup supplied)")
+
+    # --- entry quality -----------------------------------------------------
+    lines.append("")
+    lines.append("ENTRY QUALITY  (is this a good trade from THIS price?)")
+    entry_q = getattr(ctx, "entry", None)
+    if entry_q is not None:
+        lines.append(f"  Location           x{entry_q.location.factor:.2f}"
+                     f"  {entry_q.location.detail}")
+        lines.append(f"  Room               x{entry_q.room.factor:.2f}"
+                     f"  {entry_q.room.detail}")
+        lines.append(f"  Extension          x{entry_q.extension.factor:.2f}"
+                     f"  {entry_q.extension.detail}")
+    else:
+        lines.append(f"  {_DASH} (not assessed)")
 
     # --- scoring + risk ----------------------------------------------------
     lines.append("")
     lines.append("SCORING & RISK")
     if ctx.scoring is not None:
         lines.append(f"  Score direction    {ctx.scoring.direction.value}")
-        lines.append(f"  Confidence         {ctx.scoring.confidence}%"
-                     f"  ({ctx.scoring.net_score:+.0f} of {ctx.scoring.total_possible:.0f})")
+        lines.append(f"  Direction conflu.  {ctx.scoring.confidence}/100"
+                     f"  ({ctx.scoring.net_score:+.1f} of {ctx.scoring.total_possible:.0f},"
+                     f" grouped evidence — not a probability)")
+        groups = "  ".join(f"{name} {value:+.1f}"
+                           for name, value in ctx.scoring.group_scores().items())
+        lines.append(f"  Evidence groups    {groups}")
     if ctx.risk is not None:
         lines.append(f"  Risk gate          "
                      f"{'APPROVED' if ctx.risk.approved else 'REJECTED'}")
@@ -224,7 +248,7 @@ def render_text(context: MarketContext, decision: Optional[TradeDecision] = None
     lines.append("VALIDATION")
     if ctx.validation is not None:
         v = ctx.validation
-        lines.append(f"  Review adjustment  +{v.bonus} / -{v.penalty} confidence"
+        lines.append(f"  Review adjustment  +{v.bonus} / -{v.penalty} points"
                      f"   (net {v.adjustment:+d})"
                      + ("   ** FATAL PROBLEM **" if v.has_fatal else ""))
         if v.fatal_problems:
@@ -255,31 +279,41 @@ def render_text(context: MarketContext, decision: Optional[TradeDecision] = None
         lines.append("")
         lines.append(rule)
         lines.append(f"DECISION  {decision.verdict.value.upper()}"
-                     f"   confidence {decision.confidence}%"
+                     f"   confluence {decision.confidence}/100"
                      f"   (source: {decision.source.value})")
         # --- how the number was reached ------------------------------------
-        # The complete arithmetic. There is one confidence in this system and
-        # this is every term that produced it — nothing hidden, no min().
+        # The complete arithmetic. There is one score in this system and this
+        # is every term that produced it — nothing hidden, no min().
         lines.append("")
-        lines.append("  Confidence")
+        lines.append("  Confluence score   (technical agreement 0-100 — NOT a win probability)")
         if decision.deterministic_score is None:
             lines.append(f"      deterministic score      {_DASH} not computed")
         else:
             lines.append(f"      deterministic score      {decision.deterministic_score}"
-                         f"     (market conviction, scoring engine)")
+                         f"     (direction confluence, scoring engine)")
         lines.append(f"    + validation bonus         {decision.validation_bonus}"
                      f"     (review credit, max {decision.max_adjustment})")
         lines.append(f"    - validation penalty       {decision.validation_penalty}"
-                     f"     (review charge, max {decision.max_adjustment})")
+                     f"     (review charge)")
         if decision.adjusted_score is None:
             lines.append(f"    = adjusted score           {_DASH} not computed")
         else:
             lines.append(f"    = adjusted score           {decision.adjusted_score}"
                          f"     (clamped once to 0-100)")
+            lines.append(f"    x location factor          {decision.location_factor:.2f}"
+                         f"     (entry in the dealing range, 0.50-1.00)")
+            lines.append(f"      room factor              {decision.room_factor:.2f}"
+                         f"     (space before the next major level; the worse of"
+                         f" location and room is applied)")
+            lines.append(f"    x extension factor         {decision.extension_factor:.2f}"
+                         f"     (run already made, 0.50-1.00)")
+        if decision.confluence_score is None:
+            lines.append(f"    = confluence score         {_DASH} not computed")
+        else:
+            lines.append(f"    = confluence score         {decision.confluence_score}")
 
         lines.append("")
-        lines.append(f"  Bands   SKIP 0-{report_wait_min - 1}"
-                     f"   WAIT {report_wait_min}-{report_enter_min - 1}"
+        lines.append(f"  Bands   SKIP 0-{report_enter_min - 1}"
                      f"   ENTER {report_enter_min}-100")
         lines.append(f"  Verdict {decision.verdict.value.upper()}"
                      f"   — {decision.decision_reason}")
@@ -291,6 +325,8 @@ def render_text(context: MarketContext, decision: Optional[TradeDecision] = None
                 lines.append(f"    XX {item}")
             for item in decision.risk_warnings:
                 lines.append(f"    !  {item}   (warning — does not block)")
+        lines.append(f"  SL risk                  {decision.sl_risk}"
+                     f"   (warning only — not part of the decision)")
 
         lines.append(rule)
         lines.append(f"  {decision.reasoning}")
@@ -350,7 +386,7 @@ def render_telegram(context: MarketContext, decision: Optional[TradeDecision] = 
 
     if decision is not None:
         out.append(f"<b>{esc(decision.verdict.value.upper())}</b> — "
-                   f"{esc(ctx.symbol)}  ({decision.confidence}%)")
+                   f"{esc(ctx.symbol)}  (confluence {decision.confidence}/100)")
     else:
         out.append(f"<b>{esc(ctx.symbol)}</b>")
     out.append("")
@@ -375,6 +411,8 @@ def render_telegram(context: MarketContext, decision: Optional[TradeDecision] = 
         out.append(f"<b>News:</b> {esc(ctx.news.summary)}")
     if ctx.quality is not None and ctx.quality.risk_reward is not None:
         out.append(f"<b>R:R:</b> 1:{ctx.quality.risk_reward:.2f}")
+    if ctx.quality is not None:
+        out.append(f"<b>SL risk:</b> {stop_loss_risk(ctx).level.value} (warning only)")
     if ctx.risk is not None:
         out.append(f"<b>Risk gate:</b> "
                    f"{'approved' if ctx.risk.approved else 'REJECTED'}")
@@ -384,7 +422,7 @@ def render_telegram(context: MarketContext, decision: Optional[TradeDecision] = 
             out.append(f"  ! {esc(check.name)}: {esc(check.detail)}")
     if ctx.validation is not None:
         out.append(f"<b>Review:</b> +{ctx.validation.bonus} / "
-                   f"-{ctx.validation.penalty} confidence")
+                   f"-{ctx.validation.penalty} points")
         for check in ctx.validation.fatal_problems:
             out.append(f"  ✗ FATAL {esc(check.name)}: {esc(check.detail)}")
 
@@ -431,8 +469,9 @@ def _summary_bullets(context: MarketContext,
         strengths = [s for s in decision.strengths if s.strip()]
 
         # On a refusal the reason IS the message — a trader needs to know
-        # what stopped it, not what was good about it. Otherwise lead with
-        # the confluence that carried the trade.
+        # what stopped it (often a late entry, not a wrong direction), not
+        # what was good about it. Otherwise lead with the confluence that
+        # carried the trade.
         if decision.verdict is Action.SKIP and decision.decision_reason:
             bullets.append(_card_line(decision.decision_reason))
             bullets.extend(_card_line(s) for s in strengths[:1])
@@ -456,6 +495,13 @@ def _summary_bullets(context: MarketContext,
             bullets.append("⚠ " + _card_line(v.weaknesses[0].detail))
     if not bullets:
         bullets.append(_card_line("No qualitative review was available for this signal."))
+
+    # A stop worth moving gets one line of why — the trader adjusts it by
+    # hand; it never changed the decision. Kept inside the four-bullet cap.
+    sl = stop_loss_risk(context)
+    if sl.is_warning and sl.reasons:
+        bullets = bullets[:3]
+        bullets.append(f"⚠ SL risk {sl.level.value}: " + _card_line(sl.reasons[0], limit=90))
     return bullets[:4]
 
 
@@ -467,7 +513,8 @@ def render_telegram_report(
     Deliberately NOT the terminal report. That runs to thousands of
     characters of tables and is unreadable on mobile; it stays in the
     terminal and the logs. This is only what a trader needs before acting —
-    instrument, side, verdict, confidence, levels, and a few lines of why.
+    instrument, side, verdict (ENTER or SKIP), confluence score, levels with
+    the SL risk warning, and a few lines of why.
 
     At most 20 lines by construction: 8 fixed, up to 5 take-profits, up to 4
     summary bullets.
@@ -482,10 +529,11 @@ def render_telegram_report(
     lines = ["━" * 22, f"📊 <b>{symbol} — {side}</b>", ""]
 
     if decision is not None:
-        mark = {Action.ENTER: "✅", Action.WAIT: "⏸",
-                Action.SKIP: "⛔"}[decision.verdict]
+        mark = {Action.ENTER: "✅", Action.SKIP: "⛔"}[decision.verdict]
         lines.append(f"{mark} <b>Decision:</b> {decision.verdict.value.upper()}")
-        lines.append(f"🎯 <b>Confidence:</b> {decision.confidence}%")
+        # A confluence score out of 100 — deliberately not written as a
+        # percentage, which every reader takes as a chance of winning.
+        lines.append(f"🎯 <b>Confluence:</b> {decision.confidence}/100")
     else:
         lines.append("⛔ <b>Decision:</b> —")
     lines.append("")
@@ -497,7 +545,9 @@ def render_telegram_report(
         lines.append(f"💰 <b>Entry:</b> {_price(entry)}")
     stop = getattr(setup, "stop_loss", None)
     if stop is not None:
-        lines.append(f"🛑 <b>SL:</b> {_price(stop)}")
+        sl_risk = stop_loss_risk(context).level
+        flag = " ⚠" if sl_risk in (SLRisk.MEDIUM, SLRisk.HIGH) else ""
+        lines.append(f"🛑 <b>SL:</b> {_price(stop)}  (SL risk: {sl_risk.value}{flag})")
     for i, tp in enumerate(list(getattr(setup, "take_profits", None) or [])[:5], 1):
         lines.append(f"🎯 <b>TP{i}:</b> {_price(tp)}")
 

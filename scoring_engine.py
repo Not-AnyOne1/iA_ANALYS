@@ -46,18 +46,51 @@ factor is explicit and tunable, never hardcoded into the logic itself.
      when smc actually produced premium/discount zones (i.e. both a
      confirmed swing high and low exist) - otherwise 0.
 
-11. Combining factors — net_score is the sum of all ten signed votes;
-    total_possible is the sum of all ten weights (a fixed constant of the
-    engine's configuration, independent of the input). Both are reported
-    unchanged.
+     Rules 9 and 10 are still evaluated and reported, but they no longer
+     count toward the direction score — see the evidence groups below.
+
+11. Combining factors — first, redundant factors are grouped
+    (``evidence_groups.SCORING_GROUPS``), and each group is worth its
+    strongest member's configured weight: every member is scaled by
+    ``strongest / sum(members)``. No weight is invented; relative weights
+    inside a group are kept. Grouping is decided by the code, not outcomes:
+
+      market_structure  trend, bos, choch, order_block, supply_demand
+                        -> 20. All five are read off the same H1 swings.
+      liquidity         liquidity_sweep -> 10. Independent.
+      imbalance         fvg, inverse_fvg -> 8. An IFVG is an FVG closed through.
+      location          ote, premium_discount -> 0. Exact negations of each
+                        other with no price input; location is measured
+                        with the live entry price by ``entry_quality``.
+
+    Without this, one strong trend reached the score as five independent
+    confirmations — 68 of 106 points — and alone scored about 95.
+
+    ``net_score`` is the sum of the grouped signed votes and
+    ``total_possible`` the sum of the grouped weights (38 by default), a
+    constant of the configuration. Each ``FactorScore`` keeps its configured
+    weight and raw vote in ``raw_weight`` / ``raw_contribution``.
+    ``groups=()`` restores the ungrouped engine.
 
     Confidence measures CONFLUENCE — the quality of the winning side — not
-    the size of the disagreement. Let ``bullish`` and ``bearish`` be the sums
-    of the positive and negative votes, ``winner = max(...)``,
-    ``loser = min(...)`` and ``cast = winner + loser``. Two raw quantities:
+    the size of the disagreement, and NOT a probability of winning. Let
+    ``bullish`` and ``bearish`` be the sums of the positive and negative
+    votes, ``winner = max(...)``, ``loser = min(...)`` and
+    ``cast = winner + loser``. Two raw quantities:
 
         margin        = (winner - loser) / cast     # how one-sided the vote is
-        participation = cast / total_possible       # how much evidence spoke
+        participation = winner / total_possible     # evidence behind the winner
+
+    Participation counts only the evidence SUPPORTING the winning side. It
+    used to be ``cast / total_possible`` — every vote, for or against — and
+    that made opposition buy confidence: an opposing vote raised
+    participation by more than it cost in margin wherever the participation
+    curve is steep. Measured on the ungrouped engine, 30 points bullish alone
+    scored 23, and adding 10 points BEARISH lifted it to 49. Contradicting
+    evidence must only ever take confidence away; with support measured on
+    the winning side alone, it can — margin falls, participation does not
+    move — and confidence is strictly non-increasing in the losing side by
+    construction rather than by tuning. Neither curve changed.
 
     Neither is used raw. Each is passed through its own smooth S-curve, and
     the two results multiply:
@@ -99,7 +132,9 @@ factor is explicit and tunable, never hardcoded into the logic itself.
     unanimous verdict is worthless if almost nothing voted.
 
     Confidence is 0 exactly at a dead tie or an empty slate, and reaches 100
-    only when every factor votes and all agree.
+    only when every evidence group votes and all agree. With the default
+    groups, the whole market-structure group agreeing on its own reaches 86,
+    not 100: it is one piece of evidence, however many factors it lit.
 
 12. Direction — BUY if net_score > 0, SELL if net_score < 0, NONE if
     net_score == 0, EXCEPT that confidence below
@@ -120,8 +155,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from math import exp
-from typing import Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
+from evidence_groups import SCORING_GROUPS, EvidenceGroup, group_of, scale_factors
 from market_data import Timeframe
 from smc_engine import SMCAnalysis
 from structure_engine import StructureAnalysis, StructureEventType, SwingType, TrendDirection
@@ -142,6 +178,17 @@ _MARGIN_A2, _MARGIN_B2 = 3.0, 0.70
 # weight has voted and saturated once about two thirds has.
 _BASE_B = 20.17
 _BASE_C = 9.21
+
+# Freshness. An event-based vote (BOS, CHoCH, sweep, FVG, inverse FVG, order
+# block) keeps ``0.5 ** (age / FRESHNESS_HALF_LIFE)`` of its weight, age in
+# closed bars since the event. The half-life is the project's own "recent"
+# window — ATR, RSI, ADX and the extension measure all use 14 bars — so on
+# H1 a break from this session counts nearly in full, yesterday's counts
+# about a third, and a CHoCH from three days ago (measured live: 83-90 bars,
+# still voting at full weight) counts for almost nothing. Smooth: no age
+# where a vote suddenly stops. Trend and supply/demand are current STATES,
+# not events, and do not age.
+FRESHNESS_HALF_LIFE = 14.0
 
 
 def _log_logistic(x: float, alpha: float, beta: float) -> float:
@@ -206,18 +253,32 @@ class ScoreDirection(str, Enum):
 
 @dataclass(frozen=True)
 class FactorScore:
-    """One factor's contribution to the overall score."""
+    """One factor's contribution to the overall score.
+
+    ``weight`` and ``contribution`` are the values that entered the score,
+    after evidence grouping. ``raw_weight`` and ``raw_contribution`` are the
+    configured weight and the factor's own vote before grouping — kept so
+    the report can show both what the factor said and what it counted for.
+    """
 
     name: str
     weight: float                        # max possible |contribution|
     contribution: float                  # signed: -weight..+weight
     direction: Optional[TrendDirection]  # None if the factor didn't vote
     reason: str
+    group: str = ""                      # evidence group, "" if ungrouped
+    raw_weight: Optional[float] = None
+    raw_contribution: Optional[float] = None
+    freshness: float = 1.0               # share of the vote kept for the event's age
 
 
 @dataclass(frozen=True)
 class ScoringResult:
-    """The full scoring outcome for one symbol/timeframe."""
+    """The full scoring outcome for one symbol/timeframe.
+
+    ``confidence`` is a CONFLUENCE measure — how one-sided and how broad the
+    independent technical evidence is — not a probability of winning.
+    """
 
     symbol: str
     timeframe: Timeframe
@@ -227,6 +288,14 @@ class ScoringResult:
     total_possible: float
     breakdown: Tuple[FactorScore, ...]
     reasons: Tuple[str, ...]
+
+    def group_scores(self) -> Dict[str, float]:
+        """Net signed vote of each evidence group, for logging and reports."""
+        totals: Dict[str, float] = {}
+        for f in self.breakdown:
+            key = f.group or f.name
+            totals[key] = round(totals.get(key, 0.0) + f.contribution, 6)
+        return totals
 
 
 class ScoringEngine:
@@ -246,6 +315,8 @@ class ScoringEngine:
         ote_weight: float = 6.0,
         premium_discount_weight: float = 6.0,
         min_confidence_for_direction: float = 10.0,
+        groups: Sequence[EvidenceGroup] = SCORING_GROUPS,
+        freshness_half_life: float = FRESHNESS_HALF_LIFE,
     ) -> None:
         weights = dict(
             trend=trend_weight, bos=bos_weight, choch=choch_weight,
@@ -263,17 +334,32 @@ class ScoringEngine:
                 f"got {min_confidence_for_direction}"
             )
 
+        if freshness_half_life <= 0:
+            raise ValueError(f"freshness_half_life must be > 0, got {freshness_half_life}")
+
         self._weights = weights
         self._min_confidence_for_direction = min_confidence_for_direction
+        self._groups = tuple(groups)
+        self._scale = scale_factors(weights, self._groups)
+        self._half_life = freshness_half_life
 
-    def score(self, structure: StructureAnalysis, smc: SMCAnalysis) -> ScoringResult:
+    def score(self, structure: StructureAnalysis, smc: SMCAnalysis, *,
+              last_index: Optional[int] = None) -> ScoringResult:
+        """Score the evidence.
+
+        ``last_index`` is the index of the latest CLOSED bar in the analysed
+        series. With it, every event-based vote is weighed by how recently
+        the event happened (see :data:`FRESHNESS_HALF_LIFE`); without it all
+        events count in full, as before.
+        """
         if structure.symbol != smc.symbol or structure.timeframe != smc.timeframe:
             raise ValueError(
                 f"structure ({structure.symbol}/{structure.timeframe}) and smc "
                 f"({smc.symbol}/{smc.timeframe}) do not describe the same data"
             )
+        event_index = self._event_indices(structure, smc)
 
-        breakdown = (
+        raw = (
             self._score_trend(structure, smc),
             self._score_bos(structure, smc),
             self._score_choch(structure, smc),
@@ -285,9 +371,13 @@ class ScoringEngine:
             self._score_ote(structure, smc),
             self._score_premium_discount(structure, smc),
         )
+        breakdown = tuple(self._grouped(f, self._freshness(event_index.get(f.name), last_index))
+                          for f in raw)
 
-        net_score = sum(f.contribution for f in breakdown)
-        total_possible = sum(f.weight for f in breakdown)
+        # Rounded so float dust from the group scaling can never turn an
+        # exact cancellation into a sliver of direction.
+        net_score = round(sum(f.contribution for f in breakdown), 9)
+        total_possible = round(sum(f.weight for f in breakdown), 9)
         confidence = self._confidence(breakdown, total_possible)
 
         if confidence < self._min_confidence_for_direction or net_score == 0:
@@ -304,6 +394,56 @@ class ScoringEngine:
             direction=direction, confidence=confidence,
             net_score=net_score, total_possible=total_possible,
             breakdown=breakdown, reasons=reasons,
+        )
+
+    @staticmethod
+    def _event_indices(structure: StructureAnalysis, smc: SMCAnalysis) -> Dict[str, int]:
+        """When each event-based factor's latest event happened (bar index).
+
+        Picks the same "latest" object the factor methods vote on. An order
+        block dates from the break that created it, not from the candle the
+        zone is drawn on, which can sit well before the break.
+        """
+        def latest(items):
+            return max(items, key=lambda x: x.candle_index) if items else None
+
+        bos = latest([e for e in structure.events if e.type == StructureEventType.BOS])
+        choch = latest([e for e in structure.events if e.type == StructureEventType.CHOCH])
+        sweep, fvg = latest(smc.liquidity_sweeps), latest(smc.fair_value_gaps)
+        ifvg, ob = latest(smc.inverse_fvgs), latest(smc.order_blocks)
+        out = {"bos": bos, "choch": choch, "liquidity_sweep": sweep, "fvg": fvg,
+               "inverse_fvg": ifvg}
+        indices = {name: item.candle_index for name, item in out.items() if item is not None}
+        if ob is not None:
+            indices["order_block"] = ob.source_event.candle_index
+        return indices
+
+    def _freshness(self, event_index: Optional[int], last_index: Optional[int]) -> Optional[Tuple[int, float]]:
+        """(age in bars, weight multiplier) for one event, or None for a state."""
+        if event_index is None or last_index is None:
+            return None
+        age = max(0, last_index - event_index)
+        return age, 0.5 ** (age / self._half_life)
+
+    def _grouped(self, factor: FactorScore,
+                 freshness: Optional[Tuple[int, float]] = None) -> FactorScore:
+        """The factor as it enters the score: aged, then scaled by its group."""
+        scale = self._scale.get(factor.name, 1.0)
+        group = group_of(factor.name, self._groups)
+        keep, reason = 1.0, factor.reason
+        if freshness is not None and factor.contribution:
+            age, keep = freshness
+            reason = f"{factor.reason} ({age} bars ago, counts {keep:.0%})"
+        return FactorScore(
+            name=factor.name,
+            weight=round(factor.weight * scale, 9),
+            contribution=round(factor.contribution * keep * scale, 9) + 0.0,  # no -0.0
+            direction=factor.direction,
+            reason=reason,
+            group=group.name if group else "",
+            raw_weight=factor.weight,
+            raw_contribution=factor.contribution,
+            freshness=keep,
         )
 
     # ------------------------------------------------------------- confidence
@@ -326,7 +466,9 @@ class ScoringEngine:
             return 0
 
         margin = (winner - loser) / cast            # 0 at a tie, 1 unopposed
-        participation = cast / total_possible       # share of weight that voted
+        # The winning side's support only. Counting the losing side here
+        # let opposition raise confidence — see rule 11.
+        participation = min(1.0, winner / total_possible)
 
         return round(min(100.0, 100.0
                          * _margin_curve(margin)

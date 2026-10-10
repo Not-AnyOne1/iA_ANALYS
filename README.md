@@ -62,7 +62,7 @@ signal.
 | `validation_engine.py` | Skeptical 19-check challenge — validation score, fatal problems |
 | `market_context.py` | Python Analysis Engine — assembles every fact for Claude |
 | `market_providers.py` | MT5/OANDA/Polygon/AlphaVantage adapters + fallback chain |
-| `trade_decision.py` | Claude's ENTER/WAIT/SKIP verdict over computed facts |
+| `trade_decision.py` | Deterministic ENTER/SKIP verdict (confluence >= 50), SL risk warning, Claude's explanation |
 | `report.py` | Full desk report (terminal + Telegram HTML) |
 | `dashboard.py` | Standalone read-only local dashboard (not deployed by default) |
 | `Dockerfile` | Deployment image: Python 3.11 + Node.js + the Claude Code CLI |
@@ -293,7 +293,7 @@ Python Analysis Engine     market_context.py
 Validation Engine          validation_engine.py
       ↓                    (19 checks → score, strengths, weaknesses,
       ↓                     fatal problems)
-Claude reasoning           trade_decision.py   → ENTER / WAIT / SKIP
+Decision + Claude's why    trade_decision.py   → ENTER / SKIP
       ↓
 Decision + report          report.py
 ```
@@ -313,10 +313,14 @@ from even in principle. A test asserts this (`test_facts_never_include_a_candle_
 | `indicators.py` | ATR (+%), ADX with ±DI, EMA 20/50/200 and their alignment, RSI, volatility state |
 | `levels.py` | day high/low, position in day range, nearest support/resistance, distances in price / % / ATR |
 | `sessions.py` | Asia / London / New York, including overlaps |
+| `trade_geometry.py` | directional validity of the levels (LONG `SL < entry < TP`, SHORT `TP < entry < SL`) and directional R:R |
 | `trade_quality.py` | risk/reward, stop quality, target quality |
 | `news_filter.py` | high-impact event detection |
-| `scoring_engine.py` | weighted confluence score (0-100) |
+| `evidence_groups.py` | which factors are the same evidence, and must count once |
+| `scoring_engine.py` | grouped direction confluence (0-100) |
+| `entry_quality.py` | entry location in the dealing range, and extension of the move so far |
 | `risk_engine.py` | the pre-trade rejection gate |
+| `outcome_tracker.py` | decision-time snapshot of every signal, resolved later against M15 bars |
 
 Everything is deterministic: the same candles always produce the same
 analysis. Indicators use Wilder smoothing for RSI/ATR/ADX and the standard
@@ -329,24 +333,30 @@ is too short — a missing number is reported as missing, never defaulted.
 the model is never asked to reason about a trade that already failed a hard
 rule — and cannot argue its way past one.
 
-Six rules **reject** (`approved = false`, verdict SKIP, Claude never asked):
+Three rules **reject** (`approved = false`, verdict SKIP, no score computed):
 
 | Rule | Rejects when |
 | --- | --- |
-| `risk_reward` | R:R strictly below 1:1 — risking more than the trade can win (configurable) |
-| `stop_quality` | stop inside the noise band (<0.5 ATR), absurdly wide (>5 ATR), or resting beyond a swing price is likely to sweep |
-| `target_quality` | target inside the noise band, or a level stands between entry and target |
-| `spread` | spread wider than 0.25 ATR |
-| `confidence` | scoring confidence below 40 |
+| `trade_geometry` | the levels are not a trade in the stated direction — LONG needs `SL < entry < TP`, SHORT `TP < entry < SL`, for every entry and every target; also zero risk, zero/negative reward, missing or malformed (NaN, infinite, non-positive) levels. Checked first. Never repaired. |
+| `risk_reward` | directional R:R strictly below 1.10 |
 | `news` | a high-impact event is inside the blackout window |
 
-Two rules **warn** (`RiskVerdict.WARN`) — fully evaluated, reported, and sent
+The rest **warn** (`RiskVerdict.WARN`) — fully evaluated, reported, and sent
 to Claude, but they do not gate:
 
 | Rule | Warns when | Why it does not block |
 | --- | --- | --- |
+| `stop_quality` | stop inside the noise band, very wide, or beyond a sweepable swing | A judgement about levels, not an impossibility |
+| `target_quality` | target inside the noise band, or behind a level | Same |
+| `spread` | spread wider than 0.25 ATR | A cost, a matter of degree |
 | `trend_alignment` | trading against the structural trend | Reversal and mean-reversion entries are a legitimate style |
 | `volatility` | volatility is low | A market condition that can change within the life of the trade |
+| `confidence` | direction confluence below 40 | The decision bands already act on it |
+
+Risk/reward used to be `abs(TP - entry) / abs(entry - SL)`, which is blind to
+direction: a SHORT with entry 4162, SL 4152 and TP 4182 — a long's levels —
+computed R:R 2.0 and was approved at 93. `trade_geometry` makes that
+impossible; every R:R in the system is now computed in the trade's direction.
 
 Both facts are still *scored*, at the full weight of the matching
 `validation_engine` check (`higher_timeframe_trend`, `volatility`) — so they
@@ -360,14 +370,10 @@ a passed one, and warnings are shown distinctly from both.
 
 ### Claude's verdict
 
-Claude returns `ENTER`, `WAIT` or `SKIP` with reasoning, strengths, risks and
-an execution plan. Two guarantees are enforced in Python, not delegated:
-
-- **Confidence is clamped** to the deterministic scoring ceiling. Claude may
-  go lower; it can never inflate the number the engines produced.
-- **The fallback never enters.** If the CLI is unavailable, the verdict is
-  WAIT (when the risk gate approved and data exists) or SKIP — entering is
-  precisely the decision that must not be made without the reasoning step.
+The verdict — `ENTER` or `SKIP` — is computed in Python before Claude is
+called. Claude returns only reasoning, strengths, risks and an execution plan
+explaining it; its schema has no verdict and no score field, so it cannot
+change either. See "The confluence score" below.
 
 ### The Validation Engine
 
@@ -433,10 +439,8 @@ impossibility:
 | Probability model favours the other side | One model's read over a fixed lookback |
 | Stop inside the typical adverse excursion | A statistical tendency, not an impossibility |
 
-Measured on the test fixtures, each of these alone moves a clean 57/100
-setup to: counter-trend **16** (SKIP by score), model-disagrees **45**,
-low-volatility **49**, sweep-against **51** (all WAIT). Serious, scored, but
-not vetoed.
+Each of these lowers the score through the review rather than vetoing:
+serious, scored, and left to the ENTER/SKIP threshold to judge.
 
 **3. Maximum adverse excursion is measured, not assumed.** For every candle
 in the lookback window, `estimate_mae_atr()` measures how far price moved
@@ -448,9 +452,9 @@ A stop inside that range is a **weakness, not a fatal problem**. It is a
 statistical tendency rather than an impossibility — the trade can still be
 valid at a shallower entry, in a different regime, or as a deliberate
 tight-stop scalp. So it costs the check's full weight (the severe case) or
-half of it (a stop that barely clears the excursion), and the score bands
-decide from there. In practice a setup whose only serious flaw is a tight
-stop lands around the 40s — the WAIT band — instead of being forced to SKIP.
+half of it (a stop that barely clears the excursion). It is a
+trade-management finding, so it does not move the score at all: it is shown
+as the SL risk warning (below) for the trader to act on.
 
 The validation engine cannot approve anything. It only produces findings;
 the decision stays with `trade_decision.py` and the hard gate stays with
@@ -481,25 +485,126 @@ opposing case:
 
 It must also supply `alternative_scenario`, `worst_case` and `best_case`.
 
-### Confidence can only fall
+### The confluence score (current decision model)
+
+> This section supersedes any description elsewhere in this README of a
+> "confidence" built with `min()`. That design was removed.
+
+The single number behind every verdict is a **confluence score, 0-100**. It
+measures how much independent technical evidence supports this trade *from
+this price*. **It is not a probability of winning.** Nothing in it has been
+calibrated against outcomes, so `93/100` means "93/100 confluence", never
+"93% chance". The report, the Telegram card and the prompt all say
+"Confluence N/100", never a percentage.
 
 ```
-final confidence = min(deterministic scoring, validation score, Claude's own)
+direction   = scoring engine's grouped confluence, measured from the trade's side
+adjusted    = clamp(direction + review bonus - review penalty, 0, 100)
+confluence  = round(adjusted x min(location, room) x extension factor)
+
+risk REJECT -> SKIP          0-49 SKIP     50-100 ENTER      (no WAIT)
 ```
 
-Enforced in Python, not requested in the prompt. No source can raise the
-number above another's, and the report shows the arithmetic
-(`confidence = min(validation 42, scoring 70, model) = 42`) so a low number is
-always traceable to whichever assessment was most pessimistic.
+Four rules shape it, each forced by a measured defect:
 
-Two further guarantees are structural rather than prompt-dependent:
+1. **Correlated evidence counts once** (`evidence_groups.py`). Trend, BOS,
+   CHoCH, order blocks and supply/demand are all derived from the same H1
+   swing points, so they form one group worth its strongest member (20), not
+   their sum (68). FVG and inverse FVG are one group; OTE and
+   premium/discount — exact negations of each other with no price input —
+   no longer vote on direction at all. The review no longer re-counts the
+   latest BOS, CHoCH, order block, FVG and sweep, and higher-timeframe trend,
+   M15 and EMA200 agreement earns no bonus (they re-measure the state the
+   base already counts) while their disagreement still costs. A strong trend
+   on its own now scores 86 for direction, not 95-100.
+2. **Opposition can only take confidence away.** Participation is measured
+   on the winning side's support alone; previously an opposing vote could
+   *raise* the score (30 points bullish alone scored 23; adding 10 points
+   bearish lifted it to 49).
+3. **Entry quality multiplies** (`entry_quality.py`). *Location*: where the
+   entry sits in the SMC dealing range (latest confirmed swing high/low,
+   equilibrium 0.5) — no penalty in the trade's favourable half, falling
+   linearly to x0.5 at the unfavourable extreme. *Extension*: the last 14
+   bars' move in ATR, ranked against the instrument's own previous 14-bar
+   moves (up to 200 bars of history) — no penalty up to its median move,
+   falling to x0.5 for the largest. Labels: normal (at or below the median),
+   moderately extended, strongly extended (top decile). Neither factor can
+   raise the score, and neither is a reversal signal: an extended long is a
+   long with a worse entry, never a short.
+4. **Impossible trades never get a score** — see `trade_geometry` above.
+5. **Closed candles only.** Structure, SMC, BOS/CHoCH, indicators and
+   scoring read only bars that have finished; the provider's bar in
+   progress is dropped (`market_data.closed_candles`). Replaying the audited
+   signals showed a forming H1 bar flipping live verdicts. The live price is
+   still used where "now" matters — the entry, location, R:R and the latest
+   move — and each decision records the last closed bar it used.
+6. **Fresh structure counts most.** Event votes (BOS, CHoCH, sweep, FVG,
+   inverse FVG, order block) keep `0.5 ** (age / 14)` of their weight, age in
+   closed bars — the project's 14-bar "recent" window. Trend and
+   supply/demand are states and do not age.
+7. **Room before a major level.** `entry_quality` measures the distance from
+   the entry to the first MAJOR level before the nearest target —
+   multi-touch liquidity, unswept H4 swings, previous-day high/low — in ATR.
+   No penalty at 1 ATR or more (or when the target comes first), falling to
+   x0.5 at the level. In ATR, never in units of the stop, so moving the SL
+   never changes the decision. Location and room describe the same structure
+   from two angles, so the worse of the two applies once.
+8. **One owner per question.** The review's distance-to-swing checks fired on
+   ~94% of signals; they are still reported but room now owns that question.
+   High volatility ("stops more likely to be swept") is an SL-risk warning,
+   not a score input.
 
-- **A fatal problem downgrades ENTER to SKIP** after the fact. Claude is
-  still asked (so the finding gets explained), but its approval cannot
-  survive a fatal contradiction — verified by
-  `test_a_fatal_problem_downgrades_enter_to_skip`.
-- **The fallback is blocked by fatal problems too**, so a CLI outage cannot
-  turn a fatally flawed setup into a WAIT.
+**Data repair.** Twelve Data can send duplicated bars (the daily bar for
+2026-10-04 arrived twice) and near-flat weekend daily stubs. Duplicates are
+merged and daily weekend stubs dropped (`market_data.clean_candle_series`)
+instead of the whole series being rejected; a D1 warning appears only when
+daily data is genuinely unavailable.
+
+So high directional agreement with a poor entry can end in SKIP: perfect
+direction (100) bought at the top of the range after the largest run in 200
+bars is `100 x 0.5 x 0.5 = 25`, a SKIP, and the decision reason says the
+entry, not the direction, held it back.
+
+There are two verdicts only: confluence **50 or more is ENTER, below 50 is
+SKIP**. Whether 50 is the right cut can only be judged on outcomes that were
+not used to design the score — which is what the outcome log is for.
+
+### SL risk — a warning, never a gate
+
+The stop loss never changes the verdict. Each report and Telegram card shows
+an **SL risk** of `LOW`, `MEDIUM` or `HIGH` next to the stop so it can be
+adjusted by hand. It is read from two findings the pipeline already makes —
+nothing is recomputed and no threshold is new:
+
+| Source | HIGH | MEDIUM | LOW |
+| --- | --- | --- | --- |
+| Typical adverse excursion (past bars only) | stop inside it | stop barely clears it (< 1.3x) | stop clears it |
+| Stop assessment | inside the noise band, unusually wide, or beyond a sweepable swing | acceptable | good |
+
+The worse of the two is shown; `UNKNOWN` when neither could be assessed. A
+stop on the wrong side of the entry is not an SL risk — that is an impossible
+trade, and the risk gate still rejects it.
+
+### Outcome logging
+
+Every analysed signal — ENTER and SKIP — is written to the
+`signal_outcomes` table at decision time with every input to the decision:
+timestamp, symbol, timeframe, direction, entry, SL, TP, R:R, the confluence
+score and each component (direction, evidence groups, review bonus/penalty
+and every check, location and extension factors), range position, extension
+in ATR and its percentile, ATR, regime (trend, volatility, ADX) and the
+verdict. A background task resolves open rows every 30 minutes from **closed
+M15 bars that opened after the decision** (UTC — Twelve Data is asked for
+UTC explicitly): fill, first touch of SL or TP1 (both in one bar counts as a
+loss), MFE/MAE in price and R, and time to TP or SL. A row is resolved once;
+the update only matches rows still `open`, so an outcome is never rewritten.
+
+Two guarantees are structural rather than prompt-dependent:
+
+- **A risk rejection is SKIP**, whatever the score, and Claude cannot change
+  the verdict — it has no verdict or score field to return.
+- **The fallback keeps the same verdict.** If the CLI is unavailable the
+  deterministic decision stands; only the explanation is lost.
 
 ### Report
 
