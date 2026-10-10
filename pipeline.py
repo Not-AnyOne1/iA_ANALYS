@@ -47,8 +47,9 @@ from smc_engine import SMCAnalysis, SMCEngine
 from storage import Storage
 from structure_engine import StructureAnalysis, StructureEngine
 from telegram_bot import TelegramBot
+from shadow import shadow_decisions
 from telegram_client import IncomingMessage
-from trade_decision import TradeDecisionEngine
+from trade_decision import TradeDecisionEngine, decide_deterministically
 
 log = logging.getLogger(__name__)
 
@@ -283,10 +284,13 @@ class AnalysisPipeline:
 
         # Record the decision-time snapshot for outcome tracking — every
         # verdict, SKIP included, before anything is known about
-        # how the trade went. record() never raises; wrapped regardless.
+        # how the trade went — together with every shadow variant's verdict
+        # on the same context. Variants are evaluated only after the live
+        # decision exists and can never alter it. Never raises; wrapped anyway.
         if self._outcome_tracker is not None and decision is not None:
             try:
-                await self._outcome_tracker.record(context, decision, message)
+                variants = shadow_decisions(context, decide_deterministically(context))
+                await self._outcome_tracker.record(context, decision, message, variants=variants)
             except Exception:  # noqa: BLE001 - outcome logging must never break the pipeline
                 log.exception("Outcome recording failed for message %s", message.id)
 

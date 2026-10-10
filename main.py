@@ -29,6 +29,8 @@ from formatter import Formatter
 from logging_setup import configure_logging
 from market_context import MarketContextBuilder
 from market_data import MarketDataService, TwelveDataProvider
+from costs import CostModel
+from engine_version import engine_version
 from news_filter import NewsFilter
 from outcome_tracker import OutcomeTracker
 from pipeline import AnalysisPipeline
@@ -330,10 +332,20 @@ async def run_monitor(settings: Settings, formatter: Formatter) -> int:
     # candles to resolve against (a provider); without either it is simply
     # off, like every other optional integration here.
     outcome_tracker: Optional[OutcomeTracker] = None
+    cost_model: Optional[CostModel] = None
     if storage is not None and context_builder is not None:
-        outcome_tracker = OutcomeTracker(storage, market_data)
-        log.info("outcome_tracking_enabled timeframe=M15 interval=%.0fs",
-                 outcome_tracker.interval_seconds)
+        try:
+            cost_model = CostModel.from_env()
+        except ValueError:
+            log.exception("Invalid cost configuration — using the default assumptions")
+            cost_model = CostModel()
+        outcome_tracker = OutcomeTracker(storage, market_data, cost_model=cost_model)
+        log.info("outcome_tracking_enabled timeframe=M15 interval=%.0fs engine=%s costs=%s",
+                 outcome_tracker.interval_seconds, engine_version(),
+                 "bid/ask source configured" if cost_model.has_real_source
+                 else "assumed (" + ", ".join(
+                     f"{s}: {c.describe}" for s in ("XAUUSD",)
+                     for c in [cost_model.assumption(s)] if c) + ")")
 
     stop = asyncio.Event()
     _install_signal_handlers(asyncio.get_running_loop(), stop)
@@ -425,6 +437,9 @@ async def run_monitor(settings: Settings, formatter: Formatter) -> int:
             decision_engine=decision_engine,
             trade_decision_engine=trade_decision_engine, analyzer=analyzer,
         )
+        if cost_model is not None:
+            with contextlib.suppress(Exception):
+                await cost_model.aclose()
 
 
 def main(argv: list[str] | None = None) -> int:

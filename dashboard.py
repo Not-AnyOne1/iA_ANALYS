@@ -29,6 +29,8 @@ Endpoints:
   GET /api/recent?limit=N        Storage.history(N) — most recent analyses (default 20)
   GET /api/signals?limit=N       the signals among Storage.history(N) — a "signal timeline"
   GET /api/decisions?limit=N     the most recent N rows with a recorded decision — "decision history"
+  GET /api/performance?basis=net|gross&period=oos|dev|all&variant=champion&dedup=1
+                                 performance.build_report() over Storage.fetch_performance_rows()
 
 ``limit`` defaults to 20 and is capped at 200 to keep responses bounded on
 this stdlib-only, single-threaded-per-request server.
@@ -48,6 +50,7 @@ from urllib.parse import parse_qs, urlparse
 from decision_engine import _to_json
 from logging_setup import configure_logging
 from market_data import Timeframe
+from performance import build_report, report_json
 from statistics import Statistics
 from storage import Storage
 
@@ -133,6 +136,17 @@ async def get_decision_history(storage: Storage, limit: int = _DEFAULT_LIMIT) ->
     return [_to_json(r) for r in decided[:limit]]
 
 
+async def get_performance(storage: Storage, *, basis: str = "net", period: str = "oos",
+                          variant: str = "champion", deduplicate: bool = True) -> Dict[str, Any]:
+    """performance.build_report() over the tracked signals — the same report
+    ``python performance.py`` prints. Net is the default, gross is a
+    separate request, and the two are never combined."""
+    rows = await storage.fetch_performance_rows()
+    report = build_report(rows, basis=basis, variant=variant, period=period,
+                          deduplicate=deduplicate)
+    return report_json(report)
+
+
 # --------------------------------------------------------------------- server
 
 _DASHBOARD_HTML = """\
@@ -159,6 +173,17 @@ _DASHBOARD_HTML = """\
 <body>
 <h1>Signal Monitor Dashboard</h1>
 <div id="summary"></div>
+<h2>Performance (R per trade)</h2>
+<div>
+  <label>Basis <select id="p-basis"><option value="net">net (after costs)</option><option value="gross">gross (no costs)</option></select></label>
+  <label>Period <select id="p-period"><option value="oos">out-of-sample</option><option value="dev">development (debug only)</option><option value="all">all</option></select></label>
+  <label>Variant <input id="p-variant" value="champion" size="12"></label>
+  <label><input type="checkbox" id="p-dedup" checked> count duplicates once</label>
+</div>
+<div id="p-head"></div>
+<table id="p-main"></table>
+<div id="p-missed"></div>
+<div id="p-groups"></div>
 <h2>Confidence distribution</h2>
 <div id="chart"></div>
 <h2>Recent analyses</h2>
@@ -201,7 +226,48 @@ async function load() {
     `<tr><td>${sig.timestamp}</td><td>${sig.analysis.setup.symbol||''}</td>` +
     `<td>${sig.analysis.setup.direction||''}</td><td>${sig.analysis.summary}</td></tr>`).join('');
 }
+
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const num = (v, d=2, signed=true) => v == null ? '—' : (signed && v >= 0 ? '+' : '') + Number(v).toFixed(d);
+const HEAD = '<tr><th></th><th>resolved</th><th>win rate</th><th>avg win R</th><th>avg loss R</th>' +
+  '<th>expectancy R</th><th>90% interval</th><th>profit factor</th><th>total R</th><th>max DD R</th>' +
+  '<th>losing streak</th><th>median hold (min)</th><th>timeout / unfilled / pending</th></tr>';
+function row(label, s) {
+  const iv = s.expectancy_interval ? `[${num(s.expectancy_interval[0])}, ${num(s.expectancy_interval[1])}]` : '—';
+  return `<tr><td>${esc(label)}${s.small_sample ? ' <i>(small sample)</i>' : ''}</td><td>${s.resolved}</td>` +
+    `<td>${s.win_rate == null ? '—' : (s.win_rate*100).toFixed(0) + '%'}</td><td>${num(s.avg_win)}</td>` +
+    `<td>${num(s.avg_loss)}</td><td>${num(s.expectancy)}</td><td>${iv}</td>` +
+    `<td>${num(s.profit_factor, 2, false)}</td><td>${num(s.total_r)}</td><td>${num(s.max_drawdown, 2, false)}</td>` +
+    `<td>${s.longest_losing_streak}</td><td>${num(s.median_holding_minutes, 0, false)}</td>` +
+    `<td>${s.timeouts} / ${s.not_filled} / ${s.pending}</td></tr>`;
+}
+async function loadPerformance() {
+  const q = new URLSearchParams({
+    basis: document.getElementById('p-basis').value,
+    period: document.getElementById('p-period').value,
+    variant: document.getElementById('p-variant').value || 'champion',
+    dedup: document.getElementById('p-dedup').checked ? '1' : '0'});
+  const r = await j('/api/performance?' + q);
+  if (r.error) { document.getElementById('p-head').textContent = r.error; return; }
+  const costs = Object.entries(r.cost_sources).map(([k, v]) => `${esc(k)}: ${v}`).join(', ') || 'none';
+  document.getElementById('p-head').innerHTML =
+    `<p><b>${r.basis.toUpperCase()}</b> — ${r.basis === 'net' ? 'after costs (' + costs + ')' : 'before any cost: NOT a net result'}` +
+    `${r.excluded_no_costs ? ' · ' + r.excluded_no_costs + ' excluded (no cost figure)' : ''}</p>` +
+    r.notes.map(n => `<p><i>${esc(n)}</i></p>`).join('');
+  document.getElementById('p-main').innerHTML = HEAD + row('ENTER', r.enter) + row('SKIP', r.skip) +
+    row('every signal', r.all_signals);
+  document.getElementById('p-missed').innerHTML =
+    `<p>Missed winners (SKIP that made money): ${r.missed_winners.count} (${num(r.missed_winners.total_r)}R) · ` +
+    `Avoided losers: ${r.avoided_losers.count} (${num(r.avoided_losers.total_r)}R)</p>`;
+  const groups = [['ENTER by direction', r.by_direction], ['Every signal by confluence band', r.by_confluence],
+                  ['ENTER by session', r.by_session], ['ENTER by engine version', r.by_version]];
+  document.getElementById('p-groups').innerHTML = groups.map(([title, g]) =>
+    `<h3>${title}</h3><table>${HEAD}${Object.entries(g).map(([k, s]) => row(k, s)).join('')}</table>`).join('');
+}
+for (const id of ['p-basis', 'p-period', 'p-variant', 'p-dedup'])
+  document.getElementById(id).addEventListener('change', loadPerformance);
 load();
+loadPerformance();
 </script>
 </body>
 </html>
@@ -308,6 +374,18 @@ async def _route_decisions(storage: Storage, statistics: Statistics, params: Dic
     return await get_decision_history(storage, _clamp_limit(params.get("limit")))
 
 
+async def _route_performance(storage: Storage, statistics: Statistics, params: Dict[str, str]) -> Any:
+    basis = params.get("basis", "net")
+    period = params.get("period", "oos")
+    if basis not in ("net", "gross"):
+        raise ValueError("basis must be 'net' or 'gross'")
+    if period not in ("oos", "dev", "all"):
+        raise ValueError("period must be 'oos', 'dev' or 'all'")
+    return await get_performance(storage, basis=basis, period=period,
+                                 variant=params.get("variant", "champion"),
+                                 deduplicate=params.get("dedup", "1") != "0")
+
+
 _ROUTES: Dict[str, Callable] = {
     "/api/summary": _route_summary,
     "/api/today": _route_today,
@@ -319,6 +397,7 @@ _ROUTES: Dict[str, Callable] = {
     "/api/recent": _route_recent,
     "/api/signals": _route_signals,
     "/api/decisions": _route_decisions,
+    "/api/performance": _route_performance,
 }
 
 

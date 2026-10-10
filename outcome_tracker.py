@@ -54,7 +54,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from costs import CostModel, Costs
+from engine_version import engine_version
 from market_data import Candle, MarketDataError, MarketDataService, Timeframe
+from trade_accounting import account_both
 from trade_geometry import check_geometry
 from trade_quality import effective_entry
 
@@ -345,7 +348,13 @@ def resolve(
 
 @dataclass
 class OutcomeTracker:
-    """Records signals as they are decided and resolves them as bars close."""
+    """Records signals as they are decided and resolves them as bars close.
+
+    Each pass also writes the trade ACCOUNTING (``trade_accounting``) — the
+    realised R a trader would have made, gross and net of costs — once it is
+    final. Accounting is derived data in its own table: it never alters the
+    raw outcome columns, and each (signal, basis) result is written once.
+    """
 
     storage: Any
     market_data: MarketDataService
@@ -354,21 +363,56 @@ class OutcomeTracker:
     fill_window: timedelta = DEFAULT_FILL_WINDOW
     horizon: timedelta = DEFAULT_HORIZON
     clock: Callable[[], datetime] = field(default=lambda: datetime.now(timezone.utc))
+    cost_model: Optional[CostModel] = None
 
-    async def record(self, context: Any, decision: Any, message: Any = None) -> None:
-        """Persist the decision-time snapshot. Never raises."""
+    async def record(self, context: Any, decision: Any, message: Any = None,
+                     variants: Optional[Sequence[Dict[str, Any]]] = None) -> Optional[int]:
+        """Persist the decision-time snapshot, stamped and costed. Never raises.
+
+        Records the engine version, the costs a trade would pay (real
+        bid/ask when available, else the labelled assumption), the original
+        signal if this one repeats it, and every variant's verdict.
+        """
         try:
-            await self.storage.record_signal_outcome(snapshot(context, decision, message=message))
+            costs = None
+            if self.cost_model is not None:
+                costs = await self.cost_model.costs_for(getattr(context, "symbol", ""),
+                                                        getattr(context, "quote", None))
+            row = snapshot(context, decision, message=message)
+            row["engine_version"] = engine_version()
+            if costs is not None:
+                row.update(cost_spread=costs.spread, cost_slippage=costs.slippage,
+                           cost_source=costs.source)
+            row["duplicate_of"] = await self.storage.find_duplicate(row)
+            outcome_id = await self.storage.record_signal_outcome(row)
+            if outcome_id is not None and variants:
+                await self.storage.record_shadow_decisions(outcome_id, variants)
+            return outcome_id
         except Exception:  # noqa: BLE001 - logging outcomes must never break the pipeline
             log.exception("outcome_record_failed symbol=%s", getattr(context, "symbol", None))
+            return None
+
+    def _costs_of(self, row: Dict[str, Any]) -> Optional[Costs]:
+        """The costs recorded at decision time; for rows recorded before costs
+        were, the current assumption — labelled as a backfill."""
+        if row.get("cost_spread") is not None:
+            return Costs(row["cost_spread"], row.get("cost_slippage") or 0.0,
+                         row.get("cost_source") or "assumed")
+        assumed = self.cost_model.assumption(row["symbol"]) if self.cost_model else None
+        return None if assumed is None else Costs(assumed.spread, assumed.slippage,
+                                                  "assumed (backfill)")
 
     async def resolve_pending(self) -> int:
-        """Resolve every open row whose outcome is now decided. Never raises.
+        """Resolve open outcomes and write final accounting. Never raises.
 
-        One candle fetch per symbol per pass, however many rows are open.
+        One candle fetch per symbol per pass, however many rows need work.
+        Returns the number of raw outcomes resolved.
         """
         try:
             rows: List[Dict[str, Any]] = await self.storage.open_signal_outcomes()
+            to_account: List[Dict[str, Any]] = (
+                await self.storage.outcomes_needing_accounting()
+                if hasattr(self.storage, "outcomes_needing_accounting") else [])
         except Exception:  # noqa: BLE001
             log.exception("outcome_fetch_open_failed")
             return 0
@@ -377,9 +421,12 @@ class OutcomeTracker:
         by_symbol: Dict[str, List[Dict[str, Any]]] = {}
         for row in rows:
             by_symbol.setdefault(row["symbol"], []).append(row)
+        accounting_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        for row in to_account:
+            accounting_by_symbol.setdefault(row["symbol"], []).append(row)
 
         now = self.clock()
-        for symbol, symbol_rows in by_symbol.items():
+        for symbol in sorted(set(by_symbol) | set(accounting_by_symbol)):
             try:
                 series = await self.market_data.get_candles(symbol, self.timeframe,
                                                              TRACKING_CANDLES)
@@ -389,7 +436,7 @@ class OutcomeTracker:
             except Exception:  # noqa: BLE001
                 log.exception("outcome_candles_failed symbol=%s", symbol)
                 continue
-            for row in symbol_rows:
+            for row in by_symbol.get(symbol, []):
                 try:
                     outcome = resolve(row, series.candles, now,
                                       fill_window=self.fill_window, horizon=self.horizon)
@@ -400,7 +447,22 @@ class OutcomeTracker:
                                  row["id"], symbol, row.get("decision"), outcome.status)
                 except Exception:  # noqa: BLE001 - one bad row must not stop the rest
                     log.exception("outcome_resolve_failed id=%s", row.get("id"))
+            for row in accounting_by_symbol.get(symbol, []):
+                await self._account(row, series.candles, now)
         return resolved
+
+    async def _account(self, row: Dict[str, Any], candles: Sequence[Candle], now: datetime) -> None:
+        """Write whichever of the gross/net results is missing and now final."""
+        try:
+            results = account_both(row, candles, now, costs=self._costs_of(row),
+                                   fill_window=self.fill_window, horizon=self.horizon)
+            for basis, result in results.items():
+                if row.get(f"has_{basis}") or not result.final:
+                    continue
+                await self.storage.record_accounting(
+                    row["id"], result.as_row(), self.horizon.total_seconds() / 60.0)
+        except Exception:  # noqa: BLE001 - one bad row must not stop the rest
+            log.exception("outcome_accounting_failed id=%s", row.get("id"))
 
     async def run_forever(self) -> None:
         """Resolve pending rows every ``interval_seconds`` until cancelled."""

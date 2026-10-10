@@ -51,9 +51,9 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 from market_data import Timeframe
 from models import SignalAnalysis
@@ -145,7 +145,64 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     outcome_note TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_signal_outcomes_status ON signal_outcomes(status);
+
+-- What a trade on each signal would actually have made, in R (trade_accounting.py).
+-- One row per signal and basis ('gross' or 'net'), written once when final and
+-- never updated. Derived from candles after the fact: it never alters the raw
+-- outcome columns of signal_outcomes.
+CREATE TABLE IF NOT EXISTS trade_accounting (
+    outcome_id INTEGER NOT NULL,
+    basis TEXT NOT NULL,
+    status TEXT NOT NULL,
+    r REAL,
+    planned_entry REAL,
+    planned_risk REAL,
+    target REAL,
+    entry_fill REAL,
+    exit_price REAL,
+    filled_at TEXT,
+    exit_at TEXT,
+    holding_minutes REAL,
+    cost_spread REAL,
+    cost_slippage REAL,
+    cost_source TEXT,
+    horizon_minutes REAL,
+    note TEXT,
+    computed_at TEXT NOT NULL,
+    PRIMARY KEY (outcome_id, basis)
+);
+
+-- Champion/challenger: every variant's verdict on every signal (shadow.py).
+-- Only the champion's verdict is ever sent; the rest are recorded so that
+-- variants can be compared on exactly the same signals.
+CREATE TABLE IF NOT EXISTS shadow_decisions (
+    outcome_id INTEGER NOT NULL,
+    variant TEXT NOT NULL,
+    engine_version TEXT,
+    recorded_at TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    confluence_score INTEGER,
+    adjusted_score INTEGER,
+    reason TEXT,
+    details_json TEXT,
+    PRIMARY KEY (outcome_id, variant)
+);
 """
+
+# Added to signal_outcomes after it first shipped; migrated in place.
+_OUTCOME_NEW_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    ("engine_version", "TEXT"),
+    ("duplicate_of", "INTEGER"),
+    ("cost_spread", "REAL"),
+    ("cost_slippage", "REAL"),
+    ("cost_source", "TEXT"),
+)
+
+_ACCOUNTING_COLUMNS: Tuple[str, ...] = (
+    "status", "r", "planned_entry", "planned_risk", "target", "entry_fill", "exit_price",
+    "filled_at", "exit_at", "holding_minutes", "cost_spread", "cost_slippage", "cost_source",
+    "note",
+)
 
 # Written once, at decision time.
 _OUTCOME_SNAPSHOT_COLUMNS: Tuple[str, ...] = (
@@ -157,6 +214,7 @@ _OUTCOME_SNAPSHOT_COLUMNS: Tuple[str, ...] = (
     "extension_factor", "range_position", "range_low", "range_high", "extension_atr",
     "extension_percentile", "atr", "structure_trend", "volatility", "adx",
     "market_regime", "components_json", "status", "outcome_note",
+    "engine_version", "duplicate_of", "cost_spread", "cost_slippage", "cost_source",
 )
 
 # Written once, when the outcome is decided — and only onto an open row.
@@ -307,6 +365,10 @@ class Storage:
             for name, column_type in _NEW_COLUMNS:
                 if name not in existing_columns:
                     conn.execute(f"ALTER TABLE analyses ADD COLUMN {name} {column_type}")
+            outcome_columns = {row[1] for row in conn.execute("PRAGMA table_info(signal_outcomes)")}
+            for name, column_type in _OUTCOME_NEW_COLUMNS:
+                if name not in outcome_columns:
+                    conn.execute(f"ALTER TABLE signal_outcomes ADD COLUMN {name} {column_type}")
             # Only safe once the columns above exist — see _INDEXES.
             conn.executescript(_INDEXES)
             conn.commit()
@@ -555,6 +617,141 @@ class Storage:
                     tuple(resolution.get(c) for c in columns) + (outcome_id,),
                 )
             return cur.rowcount == 1
+        finally:
+            conn.close()
+
+    async def find_duplicate(self, row: Dict[str, object], window_hours: float = 6.0) -> Optional[int]:
+        """The first earlier signal this one repeats, or None.
+
+        Same symbol, direction, stop and first target, entry within 0.1, and
+        recorded within ``window_hours`` before it — a setup posted again (an
+        edit, a market and a limit version, a reminder) rather than a new
+        trade. Returns the id of the cluster's FIRST signal, so a chain of
+        repeats all point at one original. Never raises.
+        """
+        try:
+            return await asyncio.to_thread(self._find_duplicate_sync, row, window_hours)
+        except Exception:  # noqa: BLE001 - duplicate tagging must never block recording
+            log.warning("duplicate_lookup_failed symbol=%s", row.get("symbol"), exc_info=True)
+            return None
+
+    def _find_duplicate_sync(self, row: Dict[str, object], window_hours: float) -> Optional[int]:
+        if row.get("entry") is None or row.get("recorded_at") is None:
+            return None
+        since = (datetime.fromisoformat(str(row["recorded_at"]))
+                 - timedelta(hours=window_hours)).isoformat()
+        conn = self._connect()
+        try:
+            found = conn.execute(
+                "SELECT id, duplicate_of FROM signal_outcomes WHERE symbol = ? AND direction = ? "
+                "AND stop_loss IS ? AND take_profit IS ? AND ABS(entry - ?) <= 0.1 "
+                "AND recorded_at >= ? AND recorded_at <= ? ORDER BY id LIMIT 1",
+                (row.get("symbol"), row.get("direction"), row.get("stop_loss"),
+                 row.get("take_profit"), row["entry"], since, row["recorded_at"]),
+            ).fetchone()
+        finally:
+            conn.close()
+        if found is None:
+            return None
+        return int(found[1]) if found[1] is not None else int(found[0])
+
+    async def record_shadow_decisions(self, outcome_id: int,
+                                      decisions: Sequence[Dict[str, object]]) -> None:
+        """Store every variant's verdict for one signal. Never raises."""
+        try:
+            await asyncio.to_thread(self._record_shadow_sync, outcome_id, list(decisions))
+        except Exception:  # noqa: BLE001 - shadow records must never break the pipeline
+            log.error("shadow_record_failed outcome_id=%s", outcome_id, exc_info=True)
+
+    def _record_shadow_sync(self, outcome_id: int, decisions: List[Dict[str, object]]) -> None:
+        conn = self._connect()
+        try:
+            with conn:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO shadow_decisions (outcome_id, variant, engine_version, "
+                    "recorded_at, verdict, confluence_score, adjusted_score, reason, details_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [(outcome_id, d["variant"], d.get("engine_version"), d["recorded_at"],
+                      d["verdict"], d.get("confluence_score"), d.get("adjusted_score"),
+                      d.get("reason"), d.get("details_json")) for d in decisions],
+                )
+        finally:
+            conn.close()
+
+    async def outcomes_needing_accounting(self) -> List[Dict[str, object]]:
+        """Tracked signals still missing a final gross or net accounting row."""
+        return await asyncio.to_thread(self._needing_accounting_sync)
+
+    def _needing_accounting_sync(self) -> List[Dict[str, object]]:
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in conn.execute(
+                "SELECT o.*, "
+                " EXISTS(SELECT 1 FROM trade_accounting a WHERE a.outcome_id = o.id "
+                "        AND a.basis = 'gross') AS has_gross, "
+                " EXISTS(SELECT 1 FROM trade_accounting a WHERE a.outcome_id = o.id "
+                "        AND a.basis = 'net') AS has_net "
+                "FROM signal_outcomes o WHERE o.status != 'invalid' "
+                "AND (NOT EXISTS(SELECT 1 FROM trade_accounting a WHERE a.outcome_id = o.id "
+                "                AND a.basis = 'gross') "
+                "  OR NOT EXISTS(SELECT 1 FROM trade_accounting a WHERE a.outcome_id = o.id "
+                "                AND a.basis = 'net')) "
+                "ORDER BY o.id")]
+        finally:
+            conn.close()
+
+    async def record_accounting(self, outcome_id: int, result: Dict[str, object],
+                                horizon_minutes: float) -> bool:
+        """Write one FINAL accounting result. True if this call wrote it.
+
+        Write-once: the (signal, basis) key makes a second write a no-op, so
+        an accounting result, like an outcome, is never rewritten.
+        """
+        if result.get("status") not in ("tp", "sl", "timeout", "not_filled", "no_data", "invalid"):
+            raise ValueError("only a final accounting result is stored")
+        return await asyncio.to_thread(self._record_accounting_sync, outcome_id, result,
+                                       horizon_minutes)
+
+    def _record_accounting_sync(self, outcome_id: int, result: Dict[str, object],
+                                horizon_minutes: float) -> bool:
+        columns = _ACCOUNTING_COLUMNS
+        conn = self._connect()
+        try:
+            with conn:
+                cur = conn.execute(
+                    f"INSERT OR IGNORE INTO trade_accounting (outcome_id, basis, "
+                    f"{', '.join(columns)}, horizon_minutes, computed_at) "
+                    f"VALUES (?, ?, {', '.join('?' for _ in columns)}, ?, ?)",
+                    (outcome_id, result["basis"], *[result.get(c) for c in columns],
+                     horizon_minutes, datetime.now(timezone.utc).isoformat()),
+                )
+            return cur.rowcount == 1
+        finally:
+            conn.close()
+
+    async def fetch_performance_rows(self) -> List[Dict[str, object]]:
+        """Every tracked signal with its accounting and its variant verdicts.
+
+        One dict per signal: the signal_outcomes columns, ``accounting`` keyed
+        by basis, and ``variants`` mapping variant name to verdict. The
+        champion's verdict is the signal's own ``decision``.
+        """
+        return await asyncio.to_thread(self._performance_rows_sync)
+
+    def _performance_rows_sync(self) -> List[Dict[str, object]]:
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = {r["id"]: {**dict(r), "accounting": {}, "variants": {}}
+                    for r in conn.execute("SELECT * FROM signal_outcomes ORDER BY id")}
+            for a in conn.execute("SELECT * FROM trade_accounting"):
+                if a["outcome_id"] in rows:
+                    rows[a["outcome_id"]]["accounting"][a["basis"]] = dict(a)
+            for s in conn.execute("SELECT * FROM shadow_decisions"):
+                if s["outcome_id"] in rows:
+                    rows[s["outcome_id"]]["variants"][s["variant"]] = dict(s)
+            return list(rows.values())
         finally:
             conn.close()
 
