@@ -57,6 +57,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 from market_data import Timeframe
 from models import SignalAnalysis
+from trade_accounting import FINAL as FINAL_ACCOUNTING
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard for type checkers only
     from decision_engine import DecisionResult
@@ -186,6 +187,43 @@ CREATE TABLE IF NOT EXISTS shadow_decisions (
     reason TEXT,
     details_json TEXT,
     PRIMARY KEY (outcome_id, variant)
+);
+
+-- Pre-registered accounting experiments (experiments.py). An experiment's
+-- start is fixed, once, by the first signal recorded by code that carries it;
+-- only signals recorded from then on are evaluated.
+CREATE TABLE IF NOT EXISTS experiments (
+    name TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    registration TEXT,
+    parameters_json TEXT
+);
+
+-- Each experiment arm's accounting per signal and basis (gross / net /
+-- net_2x), written once when final. Kept apart from trade_accounting, which
+-- holds the live strategy's own results and is never written by an experiment.
+CREATE TABLE IF NOT EXISTS experiment_accounting (
+    outcome_id INTEGER NOT NULL,
+    experiment TEXT NOT NULL,
+    arm TEXT NOT NULL,
+    basis TEXT NOT NULL,
+    status TEXT NOT NULL,
+    r REAL,
+    planned_entry REAL,
+    planned_risk REAL,
+    target REAL,
+    entry_fill REAL,
+    exit_price REAL,
+    filled_at TEXT,
+    exit_at TEXT,
+    holding_minutes REAL,
+    cost_spread REAL,
+    cost_slippage REAL,
+    cost_source TEXT,
+    horizon_minutes REAL,
+    note TEXT,
+    computed_at TEXT NOT NULL,
+    PRIMARY KEY (outcome_id, experiment, arm, basis)
 );
 """
 
@@ -727,6 +765,127 @@ class Storage:
                      horizon_minutes, datetime.now(timezone.utc).isoformat()),
                 )
             return cur.rowcount == 1
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------ experiments
+
+    async def register_experiment(self, name: str, started_at: str, registration: str,
+                                  parameters: Dict[str, object]) -> Optional[str]:
+        """Fix an experiment's start, once. Returns the stored start. Never raises.
+
+        Write-once: a later call (every later signal, every restart) leaves
+        the first start in place, so the evaluation window cannot be moved.
+        """
+        try:
+            return await asyncio.to_thread(self._register_experiment_sync, name, started_at,
+                                           registration, parameters)
+        except Exception:  # noqa: BLE001 - experiments must never break recording
+            log.error("experiment_register_failed name=%s", name, exc_info=True)
+            return None
+
+    def _register_experiment_sync(self, name: str, started_at: str, registration: str,
+                                  parameters: Dict[str, object]) -> Optional[str]:
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO experiments (name, started_at, registration, "
+                    "parameters_json) VALUES (?, ?, ?, ?)",
+                    (name, started_at, registration, json.dumps(parameters, sort_keys=True)))
+            row = conn.execute("SELECT started_at FROM experiments WHERE name = ?",
+                               (name,)).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+
+    async def experiment_start(self, name: str) -> Optional[str]:
+        return await asyncio.to_thread(self._experiment_start_sync, name)
+
+    def _experiment_start_sync(self, name: str) -> Optional[str]:
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT started_at FROM experiments WHERE name = ?",
+                               (name,)).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+
+    async def outcomes_needing_experiment(self, name: str,
+                                          expected: int) -> List[Dict[str, object]]:
+        """Signals recorded since the experiment started that still miss some of
+        their ``expected`` final arm/basis rows. Each row carries ``experiment_done``,
+        the "arm/basis" keys already stored."""
+        return await asyncio.to_thread(self._needing_experiment_sync, name, expected)
+
+    def _needing_experiment_sync(self, name: str, expected: int) -> List[Dict[str, object]]:
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            start = conn.execute("SELECT started_at FROM experiments WHERE name = ?",
+                                 (name,)).fetchone()
+            if start is None:
+                return []
+            rows = [dict(r) for r in conn.execute(
+                "SELECT o.* FROM signal_outcomes o WHERE o.status != 'invalid' "
+                "AND o.recorded_at >= ? AND (SELECT COUNT(*) FROM experiment_accounting e "
+                "WHERE e.outcome_id = o.id AND e.experiment = ?) < ? ORDER BY o.id",
+                (start[0], name, expected))]
+            for row in rows:
+                row["experiment_done"] = {
+                    f"{e[0]}/{e[1]}" for e in conn.execute(
+                        "SELECT arm, basis FROM experiment_accounting "
+                        "WHERE outcome_id = ? AND experiment = ?", (row["id"], name))}
+            return rows
+        finally:
+            conn.close()
+
+    async def record_experiment_accounting(self, outcome_id: int, experiment: str, arm: str,
+                                           basis: str, result: Dict[str, object],
+                                           horizon_minutes: float) -> bool:
+        """Write one FINAL experiment result. True if this call wrote it. Write-once."""
+        if result.get("status") not in FINAL_ACCOUNTING:
+            raise ValueError("only a final accounting result is stored")
+        return await asyncio.to_thread(self._record_experiment_sync, outcome_id, experiment,
+                                       arm, basis, result, horizon_minutes)
+
+    def _record_experiment_sync(self, outcome_id: int, experiment: str, arm: str, basis: str,
+                                result: Dict[str, object], horizon_minutes: float) -> bool:
+        columns = _ACCOUNTING_COLUMNS
+        conn = self._connect()
+        try:
+            with conn:
+                cur = conn.execute(
+                    f"INSERT OR IGNORE INTO experiment_accounting (outcome_id, experiment, arm, "
+                    f"basis, {', '.join(columns)}, horizon_minutes, computed_at) "
+                    f"VALUES (?, ?, ?, ?, {', '.join('?' for _ in columns)}, ?, ?)",
+                    (outcome_id, experiment, arm, basis, *[result.get(c) for c in columns],
+                     horizon_minutes, datetime.now(timezone.utc).isoformat()),
+                )
+            return cur.rowcount == 1
+        finally:
+            conn.close()
+
+    async def fetch_experiment_rows(self, name: str) -> Tuple[Optional[str], List[Dict[str, object]]]:
+        """(start, signals) for one experiment: every signal recorded since its
+        start, with ``arms`` mapping "arm/basis" to the stored result."""
+        return await asyncio.to_thread(self._experiment_rows_sync, name)
+
+    def _experiment_rows_sync(self, name: str) -> Tuple[Optional[str], List[Dict[str, object]]]:
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            start = conn.execute("SELECT started_at FROM experiments WHERE name = ?",
+                                 (name,)).fetchone()
+            if start is None:
+                return None, []
+            rows = {r["id"]: {**dict(r), "arms": {}} for r in conn.execute(
+                "SELECT * FROM signal_outcomes WHERE recorded_at >= ? ORDER BY id", (start[0],))}
+            for e in conn.execute("SELECT * FROM experiment_accounting WHERE experiment = ?",
+                                  (name,)):
+                if e["outcome_id"] in rows:
+                    rows[e["outcome_id"]]["arms"][f"{e['arm']}/{e['basis']}"] = dict(e)
+            return start[0], list(rows.values())
         finally:
             conn.close()
 

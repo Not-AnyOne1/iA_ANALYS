@@ -56,6 +56,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from costs import CostModel, Costs
 from engine_version import engine_version
+from experiments import EXPECTED_ROWS, REGISTERED, AccountingExperiment, account_arms
 from market_data import Candle, MarketDataError, MarketDataService, Timeframe
 from trade_accounting import account_both
 from trade_geometry import check_geometry
@@ -354,6 +355,10 @@ class OutcomeTracker:
     realised R a trader would have made, gross and net of costs — once it is
     final. Accounting is derived data in its own table: it never alters the
     raw outcome columns, and each (signal, basis) result is written once.
+
+    Registered accounting experiments (``experiments.py``) are accounted the
+    same way into their own table, for signals recorded since each one's
+    start. They read what the live accounting reads and write nothing it reads.
     """
 
     storage: Any
@@ -364,6 +369,7 @@ class OutcomeTracker:
     horizon: timedelta = DEFAULT_HORIZON
     clock: Callable[[], datetime] = field(default=lambda: datetime.now(timezone.utc))
     cost_model: Optional[CostModel] = None
+    experiments: Sequence[AccountingExperiment] = REGISTERED
 
     async def record(self, context: Any, decision: Any, message: Any = None,
                      variants: Optional[Sequence[Dict[str, Any]]] = None) -> Optional[int]:
@@ -387,10 +393,24 @@ class OutcomeTracker:
             outcome_id = await self.storage.record_signal_outcome(row)
             if outcome_id is not None and variants:
                 await self.storage.record_shadow_decisions(outcome_id, variants)
+            if outcome_id is not None:
+                await self._register_experiments(row["recorded_at"])
             return outcome_id
         except Exception:  # noqa: BLE001 - logging outcomes must never break the pipeline
             log.exception("outcome_record_failed symbol=%s", getattr(context, "symbol", None))
             return None
+
+    async def _register_experiments(self, recorded_at: str) -> None:
+        """The first signal recorded by code carrying an experiment fixes its
+        start (write-once); later calls change nothing. Never raises."""
+        if not hasattr(self.storage, "register_experiment"):
+            return
+        for experiment in self.experiments:
+            try:
+                await self.storage.register_experiment(
+                    experiment.name, recorded_at, experiment.registration, experiment.parameters())
+            except Exception:  # noqa: BLE001 - an experiment must never affect recording
+                log.exception("experiment_register_failed name=%s", experiment.name)
 
     def _costs_of(self, row: Dict[str, Any]) -> Optional[Costs]:
         """The costs recorded at decision time; for rows recorded before costs
@@ -416,6 +436,15 @@ class OutcomeTracker:
         except Exception:  # noqa: BLE001
             log.exception("outcome_fetch_open_failed")
             return 0
+        experiment_rows: List[tuple] = []
+        for experiment in (self.experiments if hasattr(self.storage, "outcomes_needing_experiment")
+                           else ()):
+            try:
+                experiment_rows += [(experiment, row) for row in
+                                    await self.storage.outcomes_needing_experiment(
+                                        experiment.name, EXPECTED_ROWS)]
+            except Exception:  # noqa: BLE001 - an experiment must never stop tracking
+                log.exception("experiment_fetch_failed name=%s", experiment.name)
 
         resolved = 0
         by_symbol: Dict[str, List[Dict[str, Any]]] = {}
@@ -424,9 +453,12 @@ class OutcomeTracker:
         accounting_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
         for row in to_account:
             accounting_by_symbol.setdefault(row["symbol"], []).append(row)
+        experiments_by_symbol: Dict[str, List[tuple]] = {}
+        for experiment, row in experiment_rows:
+            experiments_by_symbol.setdefault(row["symbol"], []).append((experiment, row))
 
         now = self.clock()
-        for symbol in sorted(set(by_symbol) | set(accounting_by_symbol)):
+        for symbol in sorted(set(by_symbol) | set(accounting_by_symbol) | set(experiments_by_symbol)):
             try:
                 series = await self.market_data.get_candles(symbol, self.timeframe,
                                                              TRACKING_CANDLES)
@@ -449,6 +481,8 @@ class OutcomeTracker:
                     log.exception("outcome_resolve_failed id=%s", row.get("id"))
             for row in accounting_by_symbol.get(symbol, []):
                 await self._account(row, series.candles, now)
+            for experiment, row in experiments_by_symbol.get(symbol, []):
+                await self._account_experiment(experiment, row, series.candles, now)
         return resolved
 
     async def _account(self, row: Dict[str, Any], candles: Sequence[Candle], now: datetime) -> None:
@@ -463,6 +497,22 @@ class OutcomeTracker:
                     row["id"], result.as_row(), self.horizon.total_seconds() / 60.0)
         except Exception:  # noqa: BLE001 - one bad row must not stop the rest
             log.exception("outcome_accounting_failed id=%s", row.get("id"))
+
+    async def _account_experiment(self, experiment: AccountingExperiment, row: Dict[str, Any],
+                                  candles: Sequence[Candle], now: datetime) -> None:
+        """Write whichever experiment arm/basis results are missing and now final."""
+        try:
+            results = account_arms(experiment, row, candles, now, costs=self._costs_of(row),
+                                   fill_window=self.fill_window, horizon=self.horizon)
+            for key, result in results.items():
+                if key in row.get("experiment_done", ()) or not result.final:
+                    continue
+                arm, basis = key.split("/")
+                await self.storage.record_experiment_accounting(
+                    row["id"], experiment.name, arm, basis, result.as_row(),
+                    self.horizon.total_seconds() / 60.0)
+        except Exception:  # noqa: BLE001 - one bad row must not stop the rest
+            log.exception("experiment_accounting_failed name=%s id=%s", experiment.name, row.get("id"))
 
     async def run_forever(self) -> None:
         """Resolve pending rows every ``interval_seconds`` until cancelled."""

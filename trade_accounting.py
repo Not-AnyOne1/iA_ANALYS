@@ -26,6 +26,14 @@ Bar-level conservatism, as in ``outcome_tracker``: only CLOSED bars that
 opened at or after the decision are read; the stop and the target in the
 same bar count as the stop; on a resting order's fill bar only the stop
 counts, because its target touch may have come before the fill.
+
+``breakeven_at`` exists for challenger accounting only (experiment E1,
+``experiments.py``) and is never set for the live strategy. When set, once a
+closed bar has carried the bid (long) / ask (short) ``breakeven_at`` x planned
+risk beyond the fill, the stop moves to the fill price from the NEXT bar; an
+exit there is a stop order (``breakeven``: the fill minus slippage). A
+resting order's fill bar cannot arm it, for the same reason it cannot take
+profit. Left unset, nothing in this function behaves differently.
 """
 
 from __future__ import annotations
@@ -40,14 +48,14 @@ from market_data import Candle
 
 BAR = timedelta(minutes=15)
 
-FINAL = ("tp", "sl", "timeout", "not_filled", "no_data", "invalid")
+FINAL = ("tp", "sl", "breakeven", "timeout", "not_filled", "no_data", "invalid")
 
 
 @dataclass(frozen=True)
 class TradeResult:
     basis: str                      # "gross" or "net"
-    status: str                     # tp / sl / timeout / not_filled / no_data / invalid / open
-    r: Optional[float] = None       # realised R; None unless tp / sl / timeout
+    status: str                     # tp / sl / breakeven / timeout / not_filled / no_data / invalid / open
+    r: Optional[float] = None       # realised R; None unless tp / sl / breakeven / timeout
     planned_entry: Optional[float] = None
     planned_risk: Optional[float] = None
     target: Optional[float] = None
@@ -101,11 +109,14 @@ def account(
     fill_window: timedelta = timedelta(hours=24),
     horizon: timedelta = timedelta(days=5),
     bar: timedelta = BAR,
+    breakeven_at: Optional[float] = None,
 ) -> TradeResult:
     """Account one tracked signal. Pure: same inputs, same result.
 
     ``candles`` are M15 mid-price bars, oldest first. ``costs=NO_COSTS``
     gives the gross result; anything else is the net result.
+    ``breakeven_at`` (in R) is for challenger accounting only — see the
+    module docstring.
     """
     basis = "gross" if costs is NO_COSTS or costs.source == "none" else "net"
 
@@ -181,19 +192,30 @@ def account(
                           f"neither level reached within {horizon}")
 
     last_close: Optional[float] = None
+    level, armed = stop, False      # the working stop; moves to the fill once breakeven arms
     for i in range(fill_index, len(after)):
         c = after[i]
         if c.timestamp >= filled_at + horizon:
             return timeout(last_close)
         if direction == "long":
-            stop_hit, tp_hit = c.low <= stop + half, c.high >= target + half
+            stop_hit, tp_hit = c.low <= level + half, c.high >= target + half
         else:
-            stop_hit, tp_hit = c.high >= stop - half, c.low <= target - half
+            stop_hit, tp_hit = c.high >= level - half, c.low <= target - half
+        resting_fill_bar = i == fill_index and not market
         if stop_hit:
             note = "stop and target in the same bar — counted as the stop" if tp_hit else ""
+            if armed:
+                return closed_out("breakeven", level - sign * slip, c.timestamp,
+                                  f"stop moved to the fill after +{breakeven_at:g}R. {note}".strip())
             return closed_out("sl", stop - sign * slip, c.timestamp, note)
-        if tp_hit and not (i == fill_index and not market):
+        if tp_hit and not resting_fill_bar:
             return closed_out("tp", target, c.timestamp)
+        if breakeven_at is not None and not armed and not resting_fill_bar:
+            # Bid (long) / ask (short) beyond the fill on this CLOSED bar;
+            # the moved stop applies from the next bar only.
+            moved = (c.high - half) - fill_price if direction == "long" else fill_price - (c.low + half)
+            if moved >= breakeven_at * risk:
+                level, armed = fill_price, True
         last_close = c.close
 
     if closed[-1].timestamp + bar >= filled_at + horizon:
