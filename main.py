@@ -453,11 +453,13 @@ def main(argv: list[str] | None = None) -> int:
         log.error("Configuration error: %s", exc)
         return EXIT_CONFIG
 
-    configure_logging(args.log_level or settings.log_level, settings.log_file)
+    # Never fatal: an unusable log location is reported and the bot runs on
+    # console logging (configure_logging handles only that OSError).
+    active_log = configure_logging(args.log_level or settings.log_level, settings.log_file)
     install_exception_hooks()
     mode = "list-chats" if args.list_chats else ("check" if args.check else "monitor")
     log.info("bot_starting mode=%s pid=%d engine=%s log_file=%s", mode, os.getpid(),
-             engine_version(), settings.log_file)
+             engine_version(), active_log or "none (console only)")
     formatter = Formatter(
         color=settings.color, show_json=settings.show_json and not args.no_json
     )

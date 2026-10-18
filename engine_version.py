@@ -84,6 +84,10 @@ def decision_parameters() -> Dict[str, Any]:
             "weekly_session": {"symbols": sorted(market_hours.METALS),
                                "close_new_york_minutes": market_hours.CLOSE_LOCAL_MINUTES,
                                "reopen_new_york_minutes": market_hours.REOPEN_LOCAL_MINUTES},
+            # Windows are padded past the closures, cleaned, then trimmed to the
+            # requested length — the engine sees `limit` real bars.
+            "candle_window": {"policy": "pad-clean-trim",
+                              "provider_max": market_data.PROVIDER_MAX_CANDLES},
         },
     }
 

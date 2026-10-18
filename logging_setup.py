@@ -91,7 +91,12 @@ def configure_logging(
     max_bytes: int = _MAX_BYTES,
     backup_count: int = _BACKUP_COUNT,
     secrets: Optional[Iterable[str]] = None,
-) -> None:
+) -> Optional[Path]:
+    """Configure the root logger. Returns the log file actually in use, or
+    ``None`` — including when ``log_file`` could not be opened: a missing or
+    read-only log location is reported on the console and the process carries
+    on with console logging. Only that OSError is handled here; anything else
+    still raises."""
     root = logging.getLogger()
     root.setLevel(getattr(logging, level, logging.INFO))
     for handler in list(root.handlers):
@@ -106,25 +111,34 @@ def configure_logging(
     console._owned_by_logging_setup = True
     root.addHandler(console)
 
+    active: Optional[Path] = None
     if log_file is not None:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        # Rotating rather than plain: bounded total disk usage (see above).
-        # errors="replace" because Telegram text reaches the logs and can
-        # contain lone surrogates, which would otherwise raise
-        # UnicodeEncodeError from inside the logging call itself.
-        file_handler = logging.handlers.RotatingFileHandler(
-            log_file,
-            maxBytes=max_bytes,
-            backupCount=backup_count,
-            encoding="utf-8",
-            errors="replace",
-        )
-        file_handler.setFormatter(
-            logging.Formatter(_FORMAT, datefmt="%Y-%m-%d %H:%M:%S")
-        )
-        file_handler.addFilter(redactor)
-        file_handler._owned_by_logging_setup = True
-        root.addHandler(file_handler)
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            # Rotating rather than plain: bounded total disk usage (see above).
+            # errors="replace" because Telegram text reaches the logs and can
+            # contain lone surrogates, which would otherwise raise
+            # UnicodeEncodeError from inside the logging call itself.
+            file_handler = logging.handlers.RotatingFileHandler(
+                log_file,
+                maxBytes=max_bytes,
+                backupCount=backup_count,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError as exc:
+            # A log file is a convenience, never a reason not to run.
+            logging.getLogger(__name__).warning(
+                "log_file_unavailable path=%s error=%s: %s — continuing with console logging only",
+                log_file, type(exc).__name__, exc)
+        else:
+            file_handler.setFormatter(
+                logging.Formatter(_FORMAT, datefmt="%Y-%m-%d %H:%M:%S")
+            )
+            file_handler.addFilter(redactor)
+            file_handler._owned_by_logging_setup = True
+            root.addHandler(file_handler)
+            active = log_file
 
     # These libraries are chatty at INFO; keep them at WARNING unless debugging.
     quiet = logging.DEBUG if root.level <= logging.DEBUG else logging.WARNING
@@ -141,6 +155,7 @@ def configure_logging(
     # on these two loggers. (The redacting filter is a second line of defence.)
     for secret_bearing in ("httpx", "httpcore"):
         logging.getLogger(secret_bearing).setLevel(logging.WARNING)
+    return active
 
 
 def install_exception_hooks() -> None:

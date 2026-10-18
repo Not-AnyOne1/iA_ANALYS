@@ -42,7 +42,7 @@ from typing import Awaitable, Callable, Dict, List, Optional, Protocol, Tuple, T
 
 import httpx
 
-from market_hours import bar_inside_weekly_closure, follows_weekly_session
+from market_hours import bar_inside_weekly_closure, closure_allowance, follows_weekly_session
 
 log = logging.getLogger(__name__)
 
@@ -261,8 +261,27 @@ class MarketDataService:
             return cached
 
         provider = self._provider
-        series = await self._call_with_retry(lambda: provider.get_candles(symbol, timeframe, limit))
+        # Metals: the provider counts weekend stub quotes towards ``limit``, so
+        # cleaning them out used to leave the engine a third fewer bars (202
+        # of 300 H1 bars at every 2026 signal). Ask for enough extra bars to
+        # cover the closures the window spans, clean, then keep the newest
+        # ``limit`` — the same depth of real bars as before the stubs were
+        # removed. One request, the same API credit; capped at the provider's
+        # maximum page.
+        fetch = provider_request_size(symbol, timeframe, limit)
+        series = await self._call_with_retry(lambda: provider.get_candles(symbol, timeframe, fetch))
+        returned = len(series.candles)
         series = clean_candle_series(series)
+        if (fetch > limit and len(series.candles) < limit and returned >= fetch
+                and fetch < PROVIDER_MAX_CANDLES):
+            # An unusually stub-heavy stretch used up the allowance and more
+            # history exists: one wider request.
+            wider = min(PROVIDER_MAX_CANDLES, fetch * 2)
+            series = clean_candle_series(
+                await self._call_with_retry(lambda: provider.get_candles(symbol, timeframe, wider)))
+        if fetch > limit and len(series.candles) > limit:
+            series = CandleSeries(symbol=series.symbol, timeframe=series.timeframe,
+                                  provider=series.provider, candles=series.candles[-limit:])
         self._validate_candle_series(series, expected_symbol=symbol, expected_timeframe=timeframe)
 
         await self._set_cached(self._candle_cache, key, series)
@@ -374,6 +393,17 @@ class MarketDataService:
 # median weekday range; a real session — including crypto, which trades at
 # weekends — is nowhere near 10%.
 _WEEKEND_STUB_FRACTION = 0.10
+
+# Twelve Data's largest page (``outputsize``); padded requests never exceed it.
+PROVIDER_MAX_CANDLES = 5000
+
+
+def provider_request_size(symbol: str, timeframe: Timeframe, limit: int) -> int:
+    """How many bars to ask the provider for so ``limit`` real bars survive
+    cleaning. Unchanged (``limit``) for symbols without a weekly closure."""
+    if not follows_weekly_session(symbol):
+        return limit
+    return min(PROVIDER_MAX_CANDLES, max(limit, limit + closure_allowance(timeframe.duration, limit)))
 
 
 def clean_candle_series(series: CandleSeries) -> CandleSeries:

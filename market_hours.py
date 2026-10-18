@@ -26,6 +26,7 @@ the rule has been fixed since 2007.
 
 from __future__ import annotations
 
+import math
 from datetime import date, datetime, timedelta, timezone
 
 UTC = timezone.utc
@@ -75,3 +76,19 @@ def bar_inside_weekly_closure(open_ts: datetime, duration: timedelta) -> bool:
 
 def follows_weekly_session(symbol: str) -> bool:
     return symbol.strip().upper().replace("/", "") in METALS
+
+
+CLOSURE = timedelta(hours=49)                       # Friday 17:00 .. Sunday 18:00
+TRADING_PER_WEEK = timedelta(days=7) - CLOSURE      # 119 h of possible trading per week
+
+
+def closure_allowance(duration: timedelta, limit: int) -> int:
+    """Extra bars to request so that ``limit`` bars remain after the weekly
+    closure's stub quotes are removed: the most bars a provider can serve
+    inside one closure, times the number of closures a ``limit``-bar window
+    can span (plus one for a window that starts inside a closure), plus two
+    for merged duplicate timestamps. Generous on purpose — an unused bar
+    costs nothing; a missing one shortens every indicator's history."""
+    per_closure = math.ceil(CLOSURE / duration)
+    closures = math.ceil(limit * duration / TRADING_PER_WEEK) + 1
+    return per_closure * closures + 2
