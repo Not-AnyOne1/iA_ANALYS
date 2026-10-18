@@ -150,6 +150,18 @@ def test_breakdowns_by_direction_band_session_and_version():
     assert rep.by_session
 
 
+def test_every_signal_is_also_split_by_engine_version():
+    """A SKIP-only engine version still gets its own row, and mixing is flagged."""
+    rows = [_row(1, "enter", 2.0, version="v1"), _row(2, "skip", -1.0, version="v2"),
+            _row(3, "skip", 1.5, version="v2")]
+    rep = pf.build_report(rows, basis="gross")
+    assert set(rep.by_version) == {"v1"}                        # ENTER only
+    assert set(rep.by_version_all) == {"v1", "v2"}
+    assert rep.by_version_all["v2"].resolved == 2 and rep.by_version_all["v2"].total_r == pytest.approx(0.5)
+    assert any("2 engine versions" in n for n in rep.notes)
+    assert "Every signal by engine version" in pf.render_markdown(rep)
+
+
 def test_a_variant_is_judged_on_its_own_verdicts():
     rows = [_row(1, "skip", 2.0, variants={"timing": {"verdict": "enter", "confluence_score": 60}}),
             _row(2, "enter", -1.0, variants={"timing": {"verdict": "skip", "confluence_score": 40}}),

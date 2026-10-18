@@ -264,6 +264,7 @@ class Report:
     by_session: Dict[str, Summary] = field(default_factory=dict)
     by_version: Dict[str, Summary] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
+    by_version_all: Dict[str, Summary] = field(default_factory=dict)   # every signal, per engine
 
 
 def _group(trades: Sequence[Trade], key, basis: str) -> Dict[str, Summary]:
@@ -312,7 +313,11 @@ def build_report(rows: Sequence[Dict[str, Any]], *, basis: str = "net",
         by_confluence=_group(trades, lambda t: _band(t.confluence), basis),
         by_session=_group(enter, lambda t: t.session, basis),
         by_version=_group(enter, lambda t: t.engine_version or "unversioned (before P1)", basis),
+        by_version_all=_group(trades, lambda t: t.engine_version or "unversioned (before P1)", basis),
     )
+    if len(report.by_version_all) > 1:
+        report.notes.append(f"Signals from {len(report.by_version_all)} engine versions — compare "
+                            "them in the by-engine-version tables, not only pooled.")
     if period != "oos":
         report.notes.append("Includes development data recorded before "
                             f"{DEV_CUTOFF:%Y-%m-%d %H:%M} UTC — debugging only, not evidence.")
@@ -374,7 +379,8 @@ def render_markdown(report: Report) -> str:
     for title, table in (("ENTER by direction", report.by_direction),
                          ("Every signal by confluence band", report.by_confluence),
                          ("ENTER by session", report.by_session),
-                         ("ENTER by engine version", report.by_version)):
+                         ("ENTER by engine version", report.by_version),
+                         ("Every signal by engine version", report.by_version_all)):
         lines += ["", f"## {title}", "", _HEADER] + [_row(k, v) for k, v in table.items()]
     return "\n".join(lines)
 

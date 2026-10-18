@@ -27,7 +27,10 @@ approval.
   criteria, will mix decisions from two engines.
 * The six signals already in the window were re-accounted under the new rules: E1 results
   identical for all 6 (`research/recalc_baseline.py`).
-* `experiments.py` pools every signal since the start; it does not split by engine version.
+* The registered verdict in `experiments.py` still pools every signal since the start, exactly
+  as registered. The E1 report also shows the same evaluation set **split by engine version**
+  (a "Net by engine version" table and a note whenever more than one version is present), and
+  `performance.py` / the dashboard split every signal — not only ENTERs — by engine version.
 
 ## Options for the owner (none applied)
 

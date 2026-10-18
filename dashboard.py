@@ -260,7 +260,8 @@ async function loadPerformance() {
     `<p>Missed winners (SKIP that made money): ${r.missed_winners.count} (${num(r.missed_winners.total_r)}R) · ` +
     `Avoided losers: ${r.avoided_losers.count} (${num(r.avoided_losers.total_r)}R)</p>`;
   const groups = [['ENTER by direction', r.by_direction], ['Every signal by confluence band', r.by_confluence],
-                  ['ENTER by session', r.by_session], ['ENTER by engine version', r.by_version]];
+                  ['ENTER by session', r.by_session], ['ENTER by engine version', r.by_version],
+                  ['Every signal by engine version', r.by_version_all || {}]];
   document.getElementById('p-groups').innerHTML = groups.map(([title, g]) =>
     `<h3>${title}</h3><table>${HEAD}${Object.entries(g).map(([k, s]) => row(k, s)).join('')}</table>`).join('');
 }

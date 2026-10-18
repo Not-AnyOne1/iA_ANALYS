@@ -231,6 +231,7 @@ class ExperimentReport:
     criteria: List[Dict[str, Any]]
     verdict: str
     notes: List[str] = field(default_factory=list)
+    by_engine_version: Dict[str, Comparison] = field(default_factory=dict)   # net, descriptive
 
 
 def _criteria(exp: AccountingExperiment, net: Dict[str, Comparison],
@@ -345,6 +346,12 @@ def build_experiment_report(rows: Sequence[Dict[str, Any]], experiment: Accounti
     else:
         verdict = "INCONCLUSIVE — not every registered criterion met; not adopted"
 
+    # The same evaluation set, split by the engine that recorded each signal.
+    # Descriptive only: the registered verdict above pools them, as registered.
+    version_of = {r["id"]: (r.get("engine_version") or "unversioned") for r in unique}
+    by_version = {v: compare([p for p in by_basis["net"] if version_of[p.id] == v])
+                  for v in sorted({version_of[p.id] for p in by_basis["net"]})}
+
     notes = []
     if period == "development":
         notes.append("IN-SAMPLE / DEVELOPMENT DATA — a debugging exercise, not validation.")
@@ -352,13 +359,18 @@ def build_experiment_report(rows: Sequence[Dict[str, Any]], experiment: Accounti
         notes.append("Net figures use ASSUMED spread/slippage, not measured bid/ask.")
     if tables["net"]["ENTER"].resolved < experiment.min_enter:
         notes.append(f"Only {tables['net']['ENTER'].resolved} resolved ENTER signals.")
+    if len(by_version) > 1:
+        notes.append(f"The evaluation set spans {len(by_version)} engine versions — see the "
+                     "by-engine-version table; the registered verdict pools them "
+                     "(research/reports/E1_engine_versions.md).")
     return ExperimentReport(
         experiment=experiment.name, title=experiment.title, registration=experiment.registration,
         period=period, started_at=started_at, as_of=now.isoformat(),
         signals_seen=len(rows), duplicates_removed=len(dups),
         evaluation_set=len(by_basis["net"]), cost_sources=cost_sources,
         net=tables["net"], gross=tables["gross"], net_2x=tables["net_2x"],
-        evaluation_point=point, criteria=criteria, verdict=verdict, notes=notes)
+        evaluation_point=point, criteria=criteria, verdict=verdict, notes=notes,
+        by_engine_version=by_version)
 
 
 # ------------------------------------------------------------------- render
@@ -401,7 +413,9 @@ def render_markdown(report: ExperimentReport) -> str:
     multiplier = next((e.cost_multiplier for e in REGISTERED if e.name == report.experiment), 2.0)
     for label, table in (("Net (after costs)", report.net),
                          (f"Net with costs x{multiplier:g} (sensitivity)", report.net_2x),
-                         ("Gross (before any cost — NOT a net result)", report.gross)):
+                         ("Gross (before any cost — NOT a net result)", report.gross),
+                         ("Net by engine version (descriptive; the registered verdict pools them)",
+                          report.by_engine_version)):
         lines += [f"## {label}", ""] + _table(table) + [""]
     lines += ["## Registered success criteria (net)", "", "| # | rule | value | met |", "|---|---|---|---|"]
     for c in report.criteria:

@@ -506,3 +506,20 @@ def test_the_experiment_never_changes_the_live_records(tmp_path):
     assert _dump(with_e1._db_path, "trade_accounting") == _dump(without._db_path, "trade_accounting")
     assert _dump(with_e1._db_path, "signal_outcomes") == _dump(without._db_path, "signal_outcomes")
     assert _dump(without._db_path, "experiment_accounting") == []
+
+
+def test_a_window_spanning_two_engine_versions_is_split_but_the_verdict_still_pools():
+    """E1's window holds signals from two engines: the report shows each one
+    separately, while the registered verdict is computed exactly as before."""
+    rows = _enough([SAVED, SAME_WIN, SAME_WIN], [SAVED, SAME_LOSS, SAME_WIN])
+    for k, r in enumerate(rows):
+        r["engine_version"] = "52ae890+pa73ea9a4ab" if k < 60 else "bec2b74+p732199a42b"
+    now = T0 + timedelta(weeks=3)
+    split = ex.build_experiment_report(rows, started_at=T0.isoformat(), now=now)
+    pooled = ex.build_experiment_report([{k: v for k, v in r.items() if k != "engine_version"} for r in rows],
+                                        started_at=T0.isoformat(), now=now)
+    assert set(split.by_engine_version) == {"52ae890+pa73ea9a4ab", "bec2b74+p732199a42b"}
+    assert sum(c.signals for c in split.by_engine_version.values()) == split.net["every signal"].signals
+    assert split.verdict == pooled.verdict and split.net == pooled.net and split.criteria == pooled.criteria
+    assert any("2 engine versions" in n for n in split.notes)
+    assert "Net by engine version" in ex.render_markdown(split)
