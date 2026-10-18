@@ -42,6 +42,8 @@ from typing import Awaitable, Callable, Dict, List, Optional, Protocol, Tuple, T
 
 import httpx
 
+from market_hours import bar_inside_weekly_closure, follows_weekly_session
+
 log = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -280,6 +282,8 @@ class MarketDataService:
                 return await call()
             except MarketDataError as exc:
                 if not exc.retryable or attempt == attempts:
+                    log.warning("market_data_failed attempts=%d/%d retryable=%s error=%s",
+                                attempt, attempts, exc.retryable, exc)
                     raise
                 delay = self._retry_base_delay * (2 ** (attempt - 1))
                 log.warning(
@@ -386,6 +390,14 @@ def clean_candle_series(series: CandleSeries) -> CandleSeries:
        daily bars whose range is below ``_WEEKEND_STUB_FRACTION`` of the
        median weekday range are dropped. Instruments that genuinely trade at
        weekends keep them, because their weekend ranges are normal.
+    3. **Intraday weekend stub quotes** (metals only — ``market_hours``).
+       Between Friday 17:00 and Sunday 18:00 New York time Twelve Data still
+       serves intraday bars, at prices measured up to $421 away from
+       Friday's close; no order could have traded there, yet they fed
+       structure, ATR and outcome resolution. Bars lying ENTIRELY inside the
+       weekly closure are dropped; the Sunday reopening, and any bar that
+       also covers live trading, is kept. Each bar is judged by its own
+       timestamp only.
 
     Anything else that is wrong — bars genuinely out of order, impossible
     OHLC — is left for validation to reject. Changes are logged, not raised:
@@ -418,10 +430,18 @@ def clean_candle_series(series: CandleSeries) -> CandleSeries:
                 stubs = len(merged) - len(kept)
                 merged = kept
 
-    if not duplicates and not stubs:
+    session_stubs = 0
+    if series.timeframe is not Timeframe.D1 and follows_weekly_session(series.symbol):
+        duration = series.timeframe.duration
+        kept = [c for c in merged if not bar_inside_weekly_closure(c.timestamp, duration)]
+        session_stubs = len(merged) - len(kept)
+        merged = kept
+
+    if not duplicates and not stubs and not session_stubs:
         return series
     log.info("candle_series_cleaned symbol=%s timeframe=%s merged_duplicates=%d "
-             "dropped_weekend_stubs=%d", series.symbol, series.timeframe.value, duplicates, stubs)
+             "dropped_weekend_stubs=%d dropped_closed_session_bars=%d", series.symbol,
+             series.timeframe.value, duplicates, stubs, session_stubs)
     return CandleSeries(symbol=series.symbol, timeframe=series.timeframe,
                         provider=series.provider, candles=tuple(merged))
 

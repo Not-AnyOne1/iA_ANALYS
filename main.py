@@ -26,7 +26,7 @@ from claude_client import AnalysisError, ClaudeAnalyzer
 from config import ConfigError, Settings
 from decision_engine import DecisionEngine
 from formatter import Formatter
-from logging_setup import configure_logging
+from logging_setup import asyncio_exception_handler, configure_logging, install_exception_hooks
 from market_context import MarketContextBuilder
 from market_data import MarketDataService, TwelveDataProvider
 from costs import CostModel
@@ -349,6 +349,7 @@ async def run_monitor(settings: Settings, formatter: Formatter) -> int:
 
     stop = asyncio.Event()
     _install_signal_handlers(asyncio.get_running_loop(), stop)
+    asyncio.get_running_loop().set_exception_handler(asyncio_exception_handler)
 
     # Everything from here on runs under a single `finally` so that EVERY
     # exit path — including the two early returns below — releases the same
@@ -453,19 +454,35 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_CONFIG
 
     configure_logging(args.log_level or settings.log_level, settings.log_file)
+    install_exception_hooks()
+    mode = "list-chats" if args.list_chats else ("check" if args.check else "monitor")
+    log.info("bot_starting mode=%s pid=%d engine=%s log_file=%s", mode, os.getpid(),
+             engine_version(), settings.log_file)
     formatter = Formatter(
         color=settings.color, show_json=settings.show_json and not args.no_json
     )
 
+    exit_code = EXIT_RUNTIME
     try:
         if args.list_chats:
-            return asyncio.run(run_list_chats(settings))
-        runner = run_check if args.check else run_monitor
-        return asyncio.run(runner(settings, formatter))
+            exit_code = asyncio.run(run_list_chats(settings))
+        else:
+            runner = run_check if args.check else run_monitor
+            exit_code = asyncio.run(runner(settings, formatter))
+        return exit_code
     except KeyboardInterrupt:
         # Fallback path for platforms without asyncio signal handlers.
         log.info("Interrupted")
+        exit_code = EXIT_OK
         return EXIT_OK
+    except Exception:
+        log.critical("bot_crashed", exc_info=True)
+        raise
+    finally:
+        log.info("bot_exiting mode=%s code=%s", mode, exit_code)
+        for handler in logging.getLogger().handlers:
+            with contextlib.suppress(Exception):
+                handler.flush()
 
 
 if __name__ == "__main__":

@@ -70,7 +70,8 @@ def test_load_with_only_required_variables_uses_documented_defaults(env):
     assert settings.max_retries == 3
     assert settings.request_timeout == 180.0
     assert settings.log_level == "INFO"
-    assert settings.log_file is None
+    # Persistent by default, beside the database, so an unattended stop leaves a record.
+    assert settings.log_file == Path("data/logs/bot.log")
     assert settings.jsonl_output is None
     assert settings.show_json is True
     assert settings.storage_db_path == Path("data/signals.db")
@@ -114,6 +115,13 @@ def test_log_file_and_jsonl_output_become_paths_when_set(env):
 
     assert settings.log_file == Path("logs/monitor.log")
     assert settings.jsonl_output == Path("data/signals.jsonl")
+
+
+def test_the_log_file_follows_the_database_and_can_be_turned_off(env):
+    env.setenv("STORAGE_DB_PATH", "/volume/signals.db")
+    assert _load().log_file == Path("/volume/logs/bot.log")
+    env.setenv("LOG_FILE", "none")
+    assert _load().log_file is None
 
 
 # --------------------------------------------------------------------------- required-variable errors

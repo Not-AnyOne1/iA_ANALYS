@@ -842,7 +842,7 @@ All values live in `.env`; real environment variables take precedence.
 | `MAX_MESSAGE_CHARS` | `8000` | Longer messages are truncated before sending |
 | `ANALYSE_EDITS` | `false` | Also analyse edited messages |
 | `LOG_LEVEL` | `INFO` | `DEBUG` shows Telethon/HTTP internals |
-| `LOG_FILE` | — | Mirror logs to a file |
+| `LOG_FILE` | `<db folder>/logs/bot.log` | Rotating log file (10 MB x 5, secrets redacted); `none` turns it off |
 | `JSONL_OUTPUT` | — | Append structured results, one JSON object per line |
 | `COLOR_OUTPUT` | `true` | ANSI colour (also honours `NO_COLOR`) |
 | `SHOW_JSON` | `true` | Print the JSON block under each panel |
@@ -1232,7 +1232,10 @@ spread load with a lower `WORKER_COUNT` or check your plan's usage limits at
 * Message text is sent to Claude (via the local CLI, under your account) for
   analysis. Don't point it at a group whose contents you aren't permitted to
   share.
-* Nothing is stored unless you set `JSONL_OUTPUT` or `LOG_FILE`.
+* Analyses and tracked outcomes are stored in the local SQLite database
+  (`STORAGE_DB_PATH`), and logs in a local rotating file beside it
+  (`LOG_FILE=none` turns that off). Credential values, bot tokens and
+  `apikey=`-style parameters are redacted from every log line.
 * Each analysis call runs with `--disallowedTools "*"` and
   `--setting-sources ""`, so it can't act on your filesystem, run hooks, or
   reach configured MCP servers — group content is analysed as inert text, not

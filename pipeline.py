@@ -198,6 +198,12 @@ class AnalysisPipeline:
             return  # failure already logged/rendered inside _analyze_via_claude
 
         self.stats.received += 1
+        setup = analysis.setup
+        log.info("signal_received message_id=%s is_signal=%s category=%s source=%s symbol=%s "
+                 "direction=%s order=%s", message.id, analysis.is_signal,
+                 getattr(analysis.category, "value", analysis.category), analysis.source,
+                 setup.symbol, getattr(setup.direction, "value", setup.direction),
+                 getattr(setup.order_type, "value", setup.order_type))
         if analysis.is_signal:
             self.stats.signals += 1
         else:

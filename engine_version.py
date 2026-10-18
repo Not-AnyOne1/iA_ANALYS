@@ -9,7 +9,7 @@ Every decision is stamped with ``<code>+p<parameters>``:
 * **parameters** — a short hash of every value that can change a decision:
   scoring weights and curves, freshness, evidence groups, review weights and
   exclusions, entry-quality constants, risk settings, the ENTER threshold and
-  the data-cleaning rule.
+  the data-cleaning rules (including the metals weekly-session filter).
 
 Two decisions with the same stamp were made by the same rules. Outcomes are
 only ever compared within a stamp, or across stamps on purpose — which is
@@ -42,6 +42,7 @@ def decision_parameters() -> Dict[str, Any]:
     import evidence_groups
     import market_context
     import market_data
+    import market_hours
     import risk_engine
     import scoring_engine
     import trade_decision
@@ -80,6 +81,9 @@ def decision_parameters() -> Dict[str, Any]:
             "primary": market_context.DEFAULT_PRIMARY.value,
             "candle_limit": market_context.DEFAULT_CANDLE_LIMIT,
             "weekend_stub_fraction": market_data._WEEKEND_STUB_FRACTION,
+            "weekly_session": {"symbols": sorted(market_hours.METALS),
+                               "close_new_york_minutes": market_hours.CLOSE_LOCAL_MINUTES,
+                               "reopen_new_york_minutes": market_hours.REOPEN_LOCAL_MINUTES},
         },
     }
 

@@ -159,11 +159,14 @@ def test_real_weekend_sessions_are_kept():
     assert len(clean_candle_series(_daily(rows)).candles) == 7
 
 
-def test_intraday_weekend_bars_are_left_alone():
-    h1 = CandleSeries(symbol="XAUUSD", timeframe=Timeframe.H1, provider="stub", candles=(
-        _bar(datetime(2026, 10, 3, 1, tzinfo=timezone.utc), 1, 1.01, 0.99, 1),
-        _bar(datetime(2026, 10, 3, 2, tzinfo=timezone.utc), 1, 1.01, 0.99, 1)))
-    assert clean_candle_series(h1) is h1
+def test_intraday_gold_bars_inside_the_weekly_closure_are_dropped():
+    """Saturday quotes for gold are stubs (no market); crypto keeps its weekend."""
+    sat = [_bar(datetime(2026, 10, 3, h, tzinfo=timezone.utc), 1, 1.01, 0.99, 1) for h in (1, 2)]
+    fri = _bar(datetime(2026, 10, 2, 15, tzinfo=timezone.utc), 1, 1.01, 0.99, 1)
+    gold = CandleSeries(symbol="XAUUSD", timeframe=Timeframe.H1, provider="stub", candles=(fri, *sat))
+    assert clean_candle_series(gold).candles == (fri,)
+    crypto = CandleSeries(symbol="BTCUSDT", timeframe=Timeframe.H1, provider="stub", candles=tuple(sat))
+    assert clean_candle_series(crypto) is crypto
 
 
 def test_genuinely_disordered_bars_are_still_rejected():

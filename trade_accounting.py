@@ -27,6 +27,16 @@ opened at or after the decision are read; the stop and the target in the
 same bar count as the stop; on a resting order's fill bar only the stop
 counts, because its target touch may have come before the fill.
 
+**Gaps.** When a bar OPENS through the stop — the market reopened, or jumped,
+beyond it — no trade happened at the stop price. The stop exits at the
+first executable price: that bar's open at the bid (long) / ask (short),
+minus slippage. Candles are mid prices, so the bid/ask is the open less/plus
+half the spread from the trade's cost figure (real bid/ask when one was
+recorded, else the labelled assumption). It is never better than the stop
+and can be much worse; a target gapped through still fills at the target
+(the conservative side). Before this rule a gapped stop was booked at the
+stop price, which overstated every trade held across a gap.
+
 ``breakeven_at`` exists for challenger accounting only (experiment E1,
 ``experiments.py``) and is never set for the live strategy. When set, once a
 closed bar has carried the bid (long) / ask (short) ``breakeven_at`` x planned
@@ -202,6 +212,22 @@ def account(
         else:
             stop_hit, tp_hit = c.high >= level - half, c.low <= target - half
         resting_fill_bar = i == fill_index and not market
+        # A bar that OPENED through the working stop (a weekend reopen, a
+        # news jump): the stop order became a market order at the first price
+        # that traded — the open, at the bid (long) / ask (short), plus
+        # slippage. The stop price itself never traded, so it is not a fill.
+        # On a resting order's fill bar the open came BEFORE the fill, so
+        # that bar is judged the normal way.
+        opened_through = not resting_fill_bar and (
+            c.open - half <= level if direction == "long" else c.open + half >= level)
+        if opened_through:
+            note = ("market opened through the stop: filled at the open "
+                    f"{'bid' if direction == 'long' else 'ask'} plus slippage, not at the stop")
+            exit_price = c.open - sign * (half + slip)
+            if armed:
+                return closed_out("breakeven", exit_price, c.timestamp,
+                                  f"stop moved to the fill after +{breakeven_at:g}R; {note}")
+            return closed_out("sl", exit_price, c.timestamp, note)
         if stop_hit:
             note = "stop and target in the same bar — counted as the stop" if tp_hit else ""
             if armed:

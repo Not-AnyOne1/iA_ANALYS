@@ -21,14 +21,19 @@ from trade_decision import build_facts
 
 
 def _series(symbol: str, timeframe: Timeframe, n: int = 300, rising: bool = True) -> CandleSeries:
+    # Hourly timestamps in TRADING time only: a provider never has real gold
+    # bars inside the weekly closure (and clean_candle_series now drops them).
+    from market_hours import bar_inside_weekly_closure
     base = datetime(2026, 3, 10, tzinfo=timezone.utc) - timedelta(hours=n)
-    candles = []
-    for i in range(n):
-        price = 100.0 + (i * 0.5 if rising else -i * 0.5)
-        candles.append(Candle(
-            timestamp=base + timedelta(hours=i),
-            open=price, high=price + 1.0, low=price - 1.0, close=price, volume=10.0,
-        ))
+    candles, ts, i = [], base, 0
+    while len(candles) < n:
+        if not bar_inside_weekly_closure(ts, timeframe.duration):
+            price = 100.0 + (i * 0.5 if rising else -i * 0.5)
+            candles.append(Candle(
+                timestamp=ts, open=price, high=price + 1.0, low=price - 1.0, close=price, volume=10.0,
+            ))
+            i += 1
+        ts += timedelta(hours=1)
     return CandleSeries(symbol=symbol, timeframe=timeframe, provider="stub",
                         candles=tuple(candles))
 

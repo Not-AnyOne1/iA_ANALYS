@@ -178,7 +178,17 @@ class Settings:
         except ValueError as exc:
             raise ConfigError("TELEGRAM_API_ID must be an integer") from exc
 
-        log_file = _optional("LOG_FILE")
+        # Persistent by default, beside the database (on the volume when
+        # deployed), so an unattended stop leaves a record. LOG_FILE=none
+        # turns the file off; any other value is the path.
+        log_file_raw = _optional("LOG_FILE")
+        storage_db_path = Path(_optional("STORAGE_DB_PATH", "data/signals.db"))
+        if log_file_raw.lower() in ("none", "off", "false", "0", "-"):
+            log_file: Path | None = None
+        elif log_file_raw:
+            log_file = Path(log_file_raw)
+        else:
+            log_file = storage_db_path.parent / "logs" / "bot.log"
         jsonl_output = _optional("JSONL_OUTPUT")
 
         signal_parser_mode = _optional("SIGNAL_PARSER_MODE", "shadow").lower()
@@ -216,11 +226,11 @@ class Settings:
             # MCP servers each time, so they run slower than a raw API call.
             request_timeout=float(_optional("CLAUDE_TIMEOUT_SECONDS", "180")),
             log_level=_optional("LOG_LEVEL", "INFO").upper(),
-            log_file=Path(log_file) if log_file else None,
+            log_file=log_file,
             jsonl_output=Path(jsonl_output) if jsonl_output else None,
             color=_bool("COLOR_OUTPUT", True) and not os.getenv("NO_COLOR"),
             show_json=_bool("SHOW_JSON", True),
-            storage_db_path=Path(_optional("STORAGE_DB_PATH", "data/signals.db")),
+            storage_db_path=storage_db_path,
             twelve_data_api_key=_optional("TWELVE_DATA_API_KEY"),
             market_data_cache_ttl=float(_optional("MARKET_DATA_CACHE_TTL", "30")),
             market_data_timeframe=Timeframe[market_data_timeframe_raw],
