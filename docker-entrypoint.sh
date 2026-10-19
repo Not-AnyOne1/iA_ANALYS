@@ -68,10 +68,17 @@ log "Persistent data directory: $DATA_DIR"
 # TELEGRAM_SESSION is a path *prefix*; Telethon appends '.session' to it.
 SESSION_PREFIX="${TELEGRAM_SESSION:-$DATA_DIR/signal_monitor}"
 SESSION_TARGET="${SESSION_PREFIX}.session"
+# The app must open exactly the file prepared here. Without this export an
+# unset TELEGRAM_SESSION made this script seed $DATA_DIR/signal_monitor.session
+# while the app (config.py's default "signal_monitor") opened
+# /app/signal_monitor.session — a new, empty, unauthorised session — and
+# failed with "No authorised session found and stdin is not a terminal".
+export TELEGRAM_SESSION="$SESSION_PREFIX"
 
 if [ -f "$SESSION_TARGET" ]; then
-    # Already on the volume. Never re-seed over it: Telethon rewrites this
-    # file as it runs, so the volume copy is newer than the uploaded one.
+    # Already on the volume. Never re-seed over it blindly: Telethon rewrites
+    # this file as it runs, so the volume copy is newer than the uploaded one.
+    # Whether it still WORKS is checked with Telegram below, before the app.
     log "Using existing Telegram session at $SESSION_TARGET"
 elif [ -n "${TELEGRAM_SESSION_B64:-}" ]; then
     mkdir -p "$(dirname "$SESSION_TARGET")"
@@ -146,6 +153,34 @@ else
         log "       Generate the first with 'python railway_secrets.py'."
         exit 1
     fi
+fi
+
+# --- Telegram authorisation check ---------------------------------------------
+# A session file on the volume is not proof of a working login. Ask Telegram.
+# A working session is never touched; one that cannot be verified (network,
+# flood wait) is kept; only a session Telegram REJECTS is replaced from
+# TELEGRAM_SESSION_B64, and only once that replacement is itself accepted —
+# the rejected file is kept beside it as <name>.session.rejected-<time>.
+# Nothing else on the volume is touched. Output carries fingerprints only.
+if [ "${TELEGRAM_SESSION_CHECK:-1}" = "0" ]; then
+    log "Telegram session check skipped (TELEGRAM_SESSION_CHECK=0)"
+else
+    set +e
+    python telegram_session.py ensure
+    session_rc=$?
+    set -e
+    case "$session_rc" in
+        0) ;;
+        3)
+            log "FATAL: the Telegram session at $SESSION_TARGET cannot be used —"
+            log "       see the [session] lines above for the exact reason."
+            exit 1
+            ;;
+        *)
+            log "Telegram session could not be verified (exit $session_rc) — starting anyway;"
+            log "       the app reports the exact reason if it cannot sign in."
+            ;;
+    esac
 fi
 
 log "Starting: $*"

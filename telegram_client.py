@@ -12,16 +12,25 @@ import logging
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from telethon import TelegramClient, events, utils
 from telethon.errors import (
     ApiIdInvalidError,
+    AuthKeyDuplicatedError,
     AuthKeyUnregisteredError,
     ChannelPrivateError,
     FloodWaitError,
+    RPCError,
+    SessionExpiredError,
     SessionPasswordNeededError,
+    SessionRevokedError,
+    UnauthorizedError,
+    UserDeactivatedBanError,
+    UserDeactivatedError,
 )
+from telethon.tl.functions.updates import GetStateRequest
 from telethon.tl.types import Channel, Chat, User
 
 from config import Settings
@@ -180,15 +189,18 @@ class TelegramMonitor:
         return chats
 
     async def _authorize(self) -> None:
+        session_file = Path(f"{self._settings.session_path}.session").resolve()
+        # Read before connect(): connecting an empty session mints a new key into it.
+        had_key = getattr(self._client.session, "auth_key", None) is not None
+        log.info("telegram_session path=%s existed=%s", session_file, had_key)
         await self._client.connect()
         if await self._client.is_user_authorized():
             return
 
         if not sys.stdin.isatty():
             raise TelegramError(
-                "No authorised session found and stdin is not a terminal. "
-                "Run the app once interactively to log in — Telethon will store "
-                f"the session in '{self._settings.session_path}.session'."
+                "No authorised session found and stdin is not a terminal: "
+                f"{await self._why_unauthorised(session_file, had_key)}"
             )
 
         log.info("No existing session — starting interactive login")
@@ -198,6 +210,30 @@ class TelegramMonitor:
             raise TelegramError(
                 "Two-factor authentication is enabled; rerun and enter your password."
             )
+
+    async def _why_unauthorised(self, session_file: Path, had_key: bool) -> str:
+        """The real reason, which Telethon's is_user_authorized() hides: it
+        turns every Telegram error into a plain False. Never includes secrets."""
+        if not had_key:
+            return (f"'{session_file}' held no login (it was missing or empty). Check that "
+                    "TELEGRAM_SESSION points at your session file — on Railway it must be on the "
+                    "volume, e.g. /data/signal_monitor — or run the app once interactively to log in.")
+        try:
+            await self._client(GetStateRequest())
+        except ApiIdInvalidError:
+            return ("Telegram rejected TELEGRAM_API_ID / TELEGRAM_API_HASH. Use the values of the "
+                    "Telegram app the session was created with (https://my.telegram.org/apps).")
+        except (AuthKeyUnregisteredError, SessionRevokedError, SessionExpiredError,
+                AuthKeyDuplicatedError, UserDeactivatedError, UserDeactivatedBanError,
+                UnauthorizedError) as exc:
+            return (f"Telegram no longer accepts the login in '{session_file}' "
+                    f"({type(exc).__name__}). Create a new session on your machine and update "
+                    "TELEGRAM_SESSION_B64. Never run two copies of the bot with one session.")
+        except RPCError as exc:
+            return f"Telegram refused the session in '{session_file}' ({type(exc).__name__})."
+        except Exception as exc:  # noqa: BLE001 - diagnosis must not mask the original failure
+            return f"the session in '{session_file}' could not be checked ({type(exc).__name__})."
+        return f"Telegram accepted '{session_file}' on a second check — retry the start."
 
     async def _resolve_target(self) -> None:
         """Look up the configured group once, so filtering is id-based."""

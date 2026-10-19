@@ -40,23 +40,27 @@ def _encode(path: Path) -> str:
     return base64.b64encode(gzip.compress(path.read_bytes(), 9)).decode("ascii")
 
 
+def _env_value(name: str) -> str:
+    """A variable from the environment, else from .env — without importing
+    config.py, which would demand every other required variable."""
+    value = os.getenv(name, "").strip()
+    if not value:
+        env_file = Path(".env")
+        if env_file.exists():
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith(f"{name}=") and not line.startswith("#"):
+                    value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+    return value
+
+
 def _session_path() -> Path:
     """Resolve the Telethon session the same way config.py does.
 
     TELEGRAM_SESSION is a path *prefix*; Telethon appends '.session'.
     """
-    # Read .env without importing config.py, which would demand every other
-    # required variable just to locate one file.
-    prefix = os.getenv("TELEGRAM_SESSION", "").strip()
-    if not prefix:
-        env_file = Path(".env")
-        if env_file.exists():
-            for line in env_file.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line.startswith("TELEGRAM_SESSION=") and not line.startswith("#"):
-                    prefix = line.split("=", 1)[1].strip()
-                    break
-    return Path(f"{prefix or 'signal_monitor'}.session")
+    return Path(f"{_env_value('TELEGRAM_SESSION') or 'signal_monitor'}.session")
 
 
 def _credentials_path() -> Path:
@@ -97,8 +101,23 @@ def main(argv: list[str] | None = None) -> int:
         for problem in problems:
             print(f"ERROR: {problem}", file=sys.stderr)
         return 1
+    from telegram_session import api_fingerprint, inspect_file
+    info = inspect_file(session)
+    if not info.usable_structure:
+        print(f"ERROR: '{session}' is not a logged-in Telethon session (no authorization key).\n"
+              "  Log in once interactively:  python main.py --list-chats", file=sys.stderr)
+        return 1
     for problem in problems:
         print(f"WARNING: {problem}\n", file=sys.stderr)
+    # Fingerprints identify the login and the API pair without revealing them:
+    # the Railway deploy log prints the same two values on its [session] line.
+    print(f"Session '{session}': auth key fp={info.fingerprint}, data centre {info.dc_id}", file=sys.stderr)
+    api_id, api_hash = _env_value("TELEGRAM_API_ID"), _env_value("TELEGRAM_API_HASH")
+    if api_id and api_hash:
+        print(f"TELEGRAM_API_ID/TELEGRAM_API_HASH: api fp={api_fingerprint(api_id, api_hash)} "
+              "(Railway must show the same)", file=sys.stderr)
+    print("Stop the bot on this machine before deploying: one session must never run in two "
+          "places at once (Telegram then revokes it).\n", file=sys.stderr)
 
     lines = [
         "# Railway environment variables — paste into:",
