@@ -1108,7 +1108,17 @@ Raise verbosity with `LOG_LEVEL=DEBUG`. `httpx`/`httpcore` stay pinned at
 
 ### Rotating credentials
 
-Update `TELEGRAM_SESSION_B64` / `CLAUDE_CREDENTIALS_B64` **and delete the stale
+**Telegram session.** At every start the container asks Telegram whether the
+session on the volume is still authorised (`telegram_session.py ensure`; the
+deploy log shows `[session] …` lines with fingerprints only). A working session
+is never replaced. If Telegram *rejects* it, it is replaced from
+`TELEGRAM_SESSION_B64` — but only when that value is a different login that
+Telegram accepts; the rejected file stays on the volume as
+`signal_monitor.session.rejected-<time>`. So to rotate: create a fresh session
+locally, run `python railway_secrets.py`, update `TELEGRAM_SESSION_B64`, and
+redeploy. `TELEGRAM_SESSION_CHECK=0` turns the check off.
+
+**Claude credentials.** Update `CLAUDE_CREDENTIALS_B64` **and delete the stale
 file from the volume** — otherwise the existing volume copy keeps winning and
 the new value is ignored. Either attach a shell to the service and remove the
 file, or detach and recreate the volume (which also clears `signals.db`).
