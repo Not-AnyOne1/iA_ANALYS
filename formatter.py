@@ -136,7 +136,7 @@ class Formatter:
                 lines.append(f"  {self._c('Extras', 'bold'):<12} {' · '.join(extras)}")
 
         lines.append(f"  {self._c('Summary', 'bold'):<12} {analysis.summary}")
-        lines.append(f"  {self._c('Confidence', 'bold'):<12} {self._confidence_bar(analysis.confidence_pct)}")
+        lines.append(f"  {self._c('Parse conf.', 'bold'):<12} {self._confidence_bar(analysis.confidence_pct)}")
 
         if analysis.missing_fields:
             lines.append(

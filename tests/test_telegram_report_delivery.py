@@ -205,7 +205,7 @@ def test_the_message_is_a_short_card_not_the_long_report(tmp_path):
 
     assert "📊" in text and "XAUUSD" in text
     assert "Decision:" in text
-    assert "Confidence:" in text
+    assert "Setup score:" in text and "not a win probability" in text
     assert "Summary:" in text
 
     for long_report_marker in ("MARKET REPORT", "INDICATORS", "SMART MONEY",
@@ -445,7 +445,7 @@ def test_an_entry_leads_with_the_confluence():
                        strongest_reason_against="Higher timeframes are mixed."))
     summary = out.split("Summary:")[1]
     assert summary.index("Bullish BOS") < summary.index("Higher timeframes are mixed")
-    assert "72%" in out
+    assert "72/100" in out and "72%" not in out
 
 
 def test_the_card_renders_without_a_decision():

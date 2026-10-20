@@ -209,7 +209,7 @@ def render_text(context: MarketContext, decision: Optional[TradeDecision] = None
     lines.append("SCORING & RISK")
     if ctx.scoring is not None:
         lines.append(f"  Score direction    {ctx.scoring.direction.value}")
-        lines.append(f"  Confidence         {ctx.scoring.confidence}%"
+        lines.append(f"  Engine score       {ctx.scoring.confidence}/100 (heuristic, not a probability)"
                      f"  ({ctx.scoring.net_score:+.0f} of {ctx.scoring.total_possible:.0f})")
     if ctx.risk is not None:
         lines.append(f"  Risk gate          "
@@ -255,13 +255,13 @@ def render_text(context: MarketContext, decision: Optional[TradeDecision] = None
         lines.append("")
         lines.append(rule)
         lines.append(f"DECISION  {decision.verdict.value.upper()}"
-                     f"   confidence {decision.confidence}%"
+                     f"   {_score_text(decision)}"
                      f"   (source: {decision.source.value})")
         # --- how the number was reached ------------------------------------
         # The complete arithmetic. There is one confidence in this system and
         # this is every term that produced it — nothing hidden, no min().
         lines.append("")
-        lines.append("  Confidence")
+        lines.append("  Setup score (heuristic, not a win probability)")
         if decision.deterministic_score is None:
             lines.append(f"      deterministic score      {_DASH} not computed")
         else:
@@ -350,7 +350,7 @@ def render_telegram(context: MarketContext, decision: Optional[TradeDecision] = 
 
     if decision is not None:
         out.append(f"<b>{esc(decision.verdict.value.upper())}</b> — "
-                   f"{esc(ctx.symbol)}  ({decision.confidence}%)")
+                   f"{esc(ctx.symbol)}  ({esc(_score_text(decision))})")
     else:
         out.append(f"<b>{esc(ctx.symbol)}</b>")
     out.append("")
@@ -459,6 +459,39 @@ def _summary_bullets(context: MarketContext,
     return bullets[:4]
 
 
+SCORE_LABEL = "heuristic, not a win probability"
+
+
+def _score(decision) -> Optional[int]:
+    """The adjusted score, or None when the setup was not scored. A decision
+    built without the arithmetic falls back to its confidence field."""
+    if decision.adjusted_score is not None:
+        return decision.adjusted_score
+    return decision.confidence or None
+
+
+def _score_text(decision) -> str:
+    """The verdict's number as what it is: a 0-100 rule score. Never a
+    percentage — nothing in this system is a calibrated probability."""
+    score = _score(decision)
+    return "score: not scored" if score is None else f"score {score}/100"
+
+
+def score_line(decision, context) -> str:
+    """The card's score line. A blocked or unscored setup says so rather
+    than showing 0; a score forced to 0 because the engine reads the other
+    side names that side."""
+    score = _score(decision)
+    if score is None:
+        why = "blocked by the risk gate" if decision.risk_approved is False else "no score computed"
+        return f"🎯 <b>Setup score:</b> not scored ({why})"
+    scoring = getattr(context, "scoring", None)
+    if decision.deterministic_score == 0 and scoring is not None and scoring.net_score:
+        reads = "BUY" if scoring.net_score > 0 else "SELL"
+        return f"🎯 <b>Setup score:</b> {score}/100 — engine reads {reads} ({SCORE_LABEL})"
+    return f"🎯 <b>Setup score:</b> {score}/100 ({SCORE_LABEL})"
+
+
 def render_telegram_report(
     context: MarketContext, decision: Optional[TradeDecision] = None
 ) -> str:
@@ -485,7 +518,7 @@ def render_telegram_report(
         mark = {Action.ENTER: "✅", Action.WAIT: "⏸",
                 Action.SKIP: "⛔"}[decision.verdict]
         lines.append(f"{mark} <b>Decision:</b> {decision.verdict.value.upper()}")
-        lines.append(f"🎯 <b>Confidence:</b> {decision.confidence}%")
+        lines.append(score_line(decision, context))
     else:
         lines.append("⛔ <b>Decision:</b> —")
     lines.append("")
