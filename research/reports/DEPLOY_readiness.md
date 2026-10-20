@@ -200,7 +200,10 @@ are byte-identical to `origin/main`.
   | `f5c72f2` | strategy-shadow-evaluation | Strategy shadow evaluation: baseline and three candidates |
   | `06f2bd5` | strategy-shadow-evaluation | Startup persistence_check log line; live-decision comparison tool |
 
-- **Size:** 65 files, +9,701 / −21.
+Two documentation-only commits follow: `5fee3a3` and `608f3ba` (this file
+and the PR body).
+
+- **Size, code commits:** 65 files, +9,701 / −21.
   - **New:** `analyst/` (11), `strategy_shadow/` (8), `research/` (20 scripts
     and reports, no data), `tests/` (9); plus `strategy_variants.py`,
     `costs.py`, `market_hours.py` and `trade_accounting.py`, the last three
