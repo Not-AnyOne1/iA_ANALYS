@@ -34,7 +34,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import indicators
@@ -149,6 +149,42 @@ class MarketContext:
         return self.timeframes.get(self.primary_timeframe.value)
 
 
+_BAR = {Timeframe.M15: timedelta(minutes=15), Timeframe.H1: timedelta(hours=1),
+        Timeframe.H4: timedelta(hours=4), Timeframe.D1: timedelta(days=1)}
+
+
+def clean_request_size(tf: Timeframe, limit: int) -> int:
+    """Bars to request so ``limit`` real ones survive the weekend stubs."""
+    from market_hours import closure_allowance
+    bar = _BAR.get(tf)
+    return limit if bar is None else min(5000, limit + closure_allowance(bar, limit))
+
+
+def clean_series(series: CandleSeries, now: datetime, limit: int) -> CandleSeries:
+    """Closed bars only, weekend stubs removed, the last ``limit`` kept.
+
+    Expects UTC labels. A D1 bar counts as closed once its label day has
+    ended in UTC (a little after the 17:00 New York roll — conservative), and
+    for metals the Saturday and Sunday D1 bars, which lie wholly inside the
+    weekly closure, are stubs."""
+    from market_hours import bar_inside_weekly_closure, follows_weekly_session
+    bar = _BAR.get(series.timeframe)
+    if bar is None:
+        return series
+    metals = follows_weekly_session(series.symbol)
+    kept = []
+    for c in series.candles:
+        if c.timestamp + bar > now:
+            continue
+        if metals and (c.timestamp.weekday() >= 5 if series.timeframe is Timeframe.D1
+                       else bar_inside_weekly_closure(c.timestamp, bar)):
+            continue
+        kept.append(c)
+    if not kept:
+        raise MarketDataError(f"no closed {series.timeframe.value} bars", retryable=False)
+    return CandleSeries(series.symbol, series.timeframe, series.provider, tuple(kept[-limit:]))
+
+
 class MarketContextBuilder:
     """Builds a :class:`MarketContext` for one signal.
 
@@ -170,8 +206,15 @@ class MarketContextBuilder:
         timeframes: Sequence[Timeframe] = DEFAULT_TIMEFRAMES,
         primary_timeframe: Timeframe = DEFAULT_PRIMARY,
         candle_limit: int = DEFAULT_CANDLE_LIMIT,
+        clean_candles: bool = False,
     ) -> None:
         self._market_data = market_data
+        # Off (the live default): series are analysed exactly as the provider
+        # returns them, forming bar and weekend stubs included. On: candidate
+        # change ``clean_data`` (strategy_variants.py) — closed bars only,
+        # stubs dropped, the request padded so ``candle_limit`` real bars
+        # remain. Needs UTC-labelled candles (label_timezone="UTC").
+        self._clean = clean_candles
         self._structure = structure_engine or StructureEngine()
         self._smc = smc_engine or SMCEngine()
         self._scoring = scoring_engine or ScoringEngine()
@@ -185,12 +228,16 @@ class MarketContextBuilder:
         if self._primary not in self._timeframes:
             self._timeframes = (self._primary, *self._timeframes)
 
-    async def build(self, symbol: str, setup: Optional[TradeSetup] = None) -> MarketContext:
-        """Assemble every fact available for ``symbol``. Never raises."""
+    async def build(self, symbol: str, setup: Optional[TradeSetup] = None, *,
+                    now: Optional[datetime] = None) -> MarketContext:
+        """Assemble every fact available for ``symbol``. Never raises.
+
+        ``now`` is for replays only (the session and news checks read it);
+        the live bot leaves it unset and gets the wall clock, as before."""
         symbol = symbol.strip().upper()
         ctx = MarketContext(
             symbol=symbol,
-            generated_at=datetime.now(timezone.utc),
+            generated_at=now or datetime.now(timezone.utc),
             primary_timeframe=self._primary,
         )
 
@@ -249,6 +296,9 @@ class MarketContextBuilder:
         """Fetch every timeframe concurrently; record each failure."""
         async def one(tf: Timeframe):
             try:
+                if self._clean:
+                    raw = await self._market_data.get_candles(ctx.symbol, tf, clean_request_size(tf, self._limit))
+                    return tf, clean_series(raw, ctx.generated_at, self._limit)
                 return tf, await self._market_data.get_candles(ctx.symbol, tf, self._limit)
             except MarketDataError as exc:
                 return tf, exc
