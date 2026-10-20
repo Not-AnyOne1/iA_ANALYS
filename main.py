@@ -325,6 +325,37 @@ async def run_monitor(settings: Settings, formatter: Formatter) -> int:
             "(set TWELVE_DATA_API_KEY to enable live validation)"
         )
 
+    # Independent analyst (analyst/), INDEPENDENT_ANALYSIS_MODE=shadow only.
+    # Off by default: nothing below is constructed, no table is created and
+    # no request is made. In shadow it records its own verdicts in its own
+    # write-once tables, after the live report, and never changes the live
+    # verdict or what the bot sends.
+    independent_analyst = None
+    outcome_resolver = None
+    if settings.independent_analysis_mode == "shadow":
+        if storage is None or context_builder is None:
+            log.warning(
+                "independent_analysis_unavailable mode=shadow reason=%s",
+                "storage unavailable" if storage is None else "no market data provider",
+            )
+        else:
+            try:
+                from analyst.service import ShadowAnalyst
+                from analyst.store import AnalystStore
+                from analyst.tracker import OutcomeResolver
+
+                analyst_store = AnalystStore(settings.storage_db_path)
+                await analyst_store.initialize()
+                independent_analyst = ShadowAnalyst(market_data, analyst_store)
+                outcome_resolver = OutcomeResolver(
+                    analyst_store, market_data, costs=independent_analyst.costs)
+                bot.attach_shadow_store(analyst_store)
+                log.info("independent_analysis_enabled mode=shadow "
+                         "(records only; live verdicts and reports unchanged)")
+            except Exception:  # noqa: BLE001 - the shadow analyst must never take down the monitor
+                log.exception("Failed to initialize the independent analyst — continuing without it")
+                independent_analyst = outcome_resolver = None
+
     stop = asyncio.Event()
     _install_signal_handlers(asyncio.get_running_loop(), stop)
 
@@ -361,7 +392,14 @@ async def run_monitor(settings: Settings, formatter: Formatter) -> int:
             market_data=market_data, structure_engine=structure_engine, smc_engine=smc_engine,
             scoring_engine=scoring_engine, decision_engine=decision_engine,
             context_builder=context_builder, trade_decision_engine=trade_decision_engine,
+            independent_analyst=independent_analyst,
         ) as pipeline:
+            # Outside ``tasks`` on purpose: its ending must never be mistaken
+            # for the pipeline or the monitor ending.
+            resolver_task = (
+                asyncio.create_task(outcome_resolver.run_forever(), name="independent-outcomes")
+                if outcome_resolver is not None else None
+            )
             tasks = {
                 asyncio.create_task(pipeline.run(), name="pipeline"),
                 asyncio.create_task(monitor.run_forever(), name="telegram"),
@@ -389,6 +427,10 @@ async def run_monitor(settings: Settings, formatter: Formatter) -> int:
             # Stop accepting new messages, then finish what is already queued.
             await monitor.stop()
             await pipeline.drain()
+            if resolver_task is not None:
+                resolver_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await resolver_task
 
             for task in pending:
                 task.cancel()

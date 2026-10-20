@@ -127,6 +127,11 @@ class MarketContext:
     # an indicator" true — there is no series in its input to compute from.
     primary_candles: Tuple[Candle, ...] = ()
 
+    # Every series fetched for this context, as the provider returned it.
+    # Kept only so the shadow analyst (``analyst/service.py``) can reuse
+    # them instead of fetching again; nothing in the live decision reads it.
+    candle_series: Dict[Timeframe, CandleSeries] = field(default_factory=dict)
+
     # Anything that could not be computed, and why.
     warnings: List[str] = field(default_factory=list)
 
@@ -191,6 +196,7 @@ class MarketContextBuilder:
 
         await self._add_quote(ctx)
         series_by_tf = await self._fetch_series(ctx)
+        ctx.candle_series = dict(series_by_tf)
         self._add_timeframe_analysis(ctx, series_by_tf)
         self._add_structure_and_smc(ctx, series_by_tf)
         self._add_levels(ctx, series_by_tf)

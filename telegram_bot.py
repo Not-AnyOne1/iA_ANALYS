@@ -260,6 +260,7 @@ class TelegramBot:
         self._subscribers: set[int] = set()
         self._market_data: Optional[MarketDataService] = None
         self._statistics: Optional[Statistics] = None
+        self._shadow_store = None
 
     def attach_storage(self, storage: Storage) -> None:
         """Give ``/latest`` and ``/history`` a persistent data source
@@ -292,6 +293,13 @@ class TelegramBot:
         """
         self._market_data = service
 
+    def attach_shadow_store(self, store) -> None:
+        """Enable ``/shadow`` — the latest independent-analysis card, pulled
+        on request by the configured bot chat only (``TELEGRAM_BOT_CHAT_ID``),
+        never pushed and never shown to subscribers. Attach before
+        :meth:`start`; without it the command is not registered at all."""
+        self._shadow_store = store
+
     # ------------------------------------------------------------------ lifecycle
 
     async def start(self) -> None:
@@ -316,6 +324,8 @@ class TelegramBot:
             ("price", self._cmd_price),
         ):
             self._application.add_handler(CommandHandler(command, handler))
+        if self._shadow_store is not None:
+            self._application.add_handler(CommandHandler("shadow", self._cmd_shadow))
 
         await self._application.initialize()
         await self._application.start()
@@ -812,6 +822,17 @@ class TelegramBot:
         # storage.history() already returns most-recent-first.
         rendered = "\n\n".join(self._render_record(r) for r in records)
         await self._reply(update, rendered)
+
+    async def _cmd_shadow(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_configured_chat(update) or self._shadow_store is None:
+            return
+        try:
+            card = await self._shadow_store.latest_card()
+        except Exception:  # noqa: BLE001 - a query failure must not break the bot
+            log.exception("bot_shadow_query_failed")
+            await self._reply(update, "Shadow analysis is temporarily unavailable.")
+            return
+        await self._reply(update, card or "No shadow analysis recorded yet.")
 
     async def _cmd_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Manual, on-demand consumer of market_data.MarketDataService —

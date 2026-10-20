@@ -30,6 +30,7 @@ _USERNAME_RE = re.compile(
 
 # RFC-001: how the regex-first parser interacts with the Claude fallback.
 _VALID_PARSER_MODES = {"shadow", "active", "off"}
+_VALID_INDEPENDENT_MODES = {"off", "shadow"}
 
 
 class ConfigError(RuntimeError):
@@ -166,6 +167,13 @@ class Settings:
     # Populated for display purposes only; filled in by the Telegram client.
     _resolved: dict = field(default_factory=dict, compare=False, repr=False)
 
+    # --- Independent analyst (analyst/) --------------------------------------
+    # "off" (default): not constructed at all — no tables, no requests.
+    # "shadow": analyses every XAUUSD signal after the live report and records
+    # it in its own write-once tables. Never changes the live verdict or what
+    # the bot sends. There is deliberately no live mode.
+    independent_analysis_mode: str = "off"
+
     @classmethod
     def load(cls, env_file: str | os.PathLike[str] | None = ".env") -> "Settings":
         """Read ``.env`` (if present) plus the process environment."""
@@ -186,6 +194,13 @@ class Settings:
             raise ConfigError(
                 f"SIGNAL_PARSER_MODE must be one of {sorted(_VALID_PARSER_MODES)}, "
                 f"got {signal_parser_mode!r}"
+            )
+
+        independent_mode = _optional("INDEPENDENT_ANALYSIS_MODE", "off").lower()
+        if independent_mode not in _VALID_INDEPENDENT_MODES:
+            raise ConfigError(
+                f"INDEPENDENT_ANALYSIS_MODE must be one of {sorted(_VALID_INDEPENDENT_MODES)}, "
+                f"got {independent_mode!r}"
             )
 
         market_data_timeframe_raw = _optional("MARKET_DATA_TIMEFRAME", "H1").upper()
@@ -224,6 +239,7 @@ class Settings:
             twelve_data_api_key=_optional("TWELVE_DATA_API_KEY"),
             market_data_cache_ttl=float(_optional("MARKET_DATA_CACHE_TTL", "30")),
             market_data_timeframe=Timeframe[market_data_timeframe_raw],
+            independent_analysis_mode=independent_mode,
         )
 
     @property

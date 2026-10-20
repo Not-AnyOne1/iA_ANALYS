@@ -30,7 +30,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, TextIO
+from typing import TYPE_CHECKING, Optional, TextIO
 
 from claude_client import AnalysisError, ClaudeAnalyzer
 from config import Settings
@@ -49,7 +49,14 @@ from telegram_bot import TelegramBot
 from telegram_client import IncomingMessage
 from trade_decision import TradeDecisionEngine
 
+if TYPE_CHECKING:
+    from analyst.service import ShadowAnalyst
+
 log = logging.getLogger(__name__)
+
+# Upper bound on the shadow analyst's work per signal (one M5 request plus
+# pure computation); it runs after the live report, never before it.
+_SHADOW_TIMEOUT_SECONDS = 60.0
 
 
 @dataclass
@@ -108,6 +115,7 @@ class AnalysisPipeline:
         context_builder: Optional["MarketContextBuilder"] = None,
         trade_decision_engine: Optional["TradeDecisionEngine"] = None,
         emit_reports: bool = True,
+        independent_analyst: Optional["ShadowAnalyst"] = None,
     ) -> None:
         self._settings = settings
         self._queue = queue
@@ -123,6 +131,10 @@ class AnalysisPipeline:
         self._context_builder = context_builder
         self._trade_decision_engine = trade_decision_engine
         self._emit_reports = emit_reports
+        # INDEPENDENT_ANALYSIS_MODE=shadow only; None (the default) runs
+        # nothing extra at all.
+        self._independent_analyst = independent_analyst
+        self._independent_tasks: set = set()
         self._print_lock = asyncio.Lock()
         self._jsonl: TextIO | None = None
         self.stats = Stats()
@@ -142,6 +154,11 @@ class AnalysisPipeline:
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:
+        if self._independent_tasks:
+            # Let in-flight shadow analyses finish their write, briefly.
+            _, still = await asyncio.wait(set(self._independent_tasks), timeout=10)
+            for task in still:
+                task.cancel()
         if self._jsonl is not None:
             self._jsonl.close()
             self._jsonl = None
@@ -307,7 +324,29 @@ class AnalysisPipeline:
                 context.risk.approved if context.risk else None,
             )
 
+        # Shadow analyst, started only after the live verdict was decided,
+        # rendered and sent, and run as a separate task so it cannot delay
+        # the storage write below or anything else on the live path.
+        if self._independent_analyst is not None:
+            task = asyncio.create_task(
+                self._run_independent(message, analysis, context, decision),
+                name=f"independent-analysis-{message.id}",
+            )
+            self._independent_tasks.add(task)
+            task.add_done_callback(self._independent_tasks.discard)
+
         return context.structure, context.smc, decision
+
+    async def _run_independent(self, message, analysis, context, decision) -> None:
+        """Bounded in time; any failure is logged and dropped."""
+        assert self._independent_analyst is not None
+        try:
+            await asyncio.wait_for(
+                self._independent_analyst.on_signal(message, analysis, context, decision),
+                timeout=_SHADOW_TIMEOUT_SECONDS,
+            )
+        except Exception:  # noqa: BLE001 - the shadow analyst must never break the pipeline
+            log.exception("Independent analysis failed for message %s", message.id)
 
     async def _enrich(
         self, message: IncomingMessage, analysis: SignalAnalysis
