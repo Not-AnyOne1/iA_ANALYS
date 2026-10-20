@@ -92,9 +92,14 @@ d.close(); s.close(); print("copied to", dst)
 EOF
 
 # 3. Only if /data/signals.db does NOT exist yet: put the copy in place
+#    (use the exact path printed by step 2)
 test -e /data/signals.db && echo "STOP: /data/signals.db exists — compare before choosing" \
-  || cp /data/signals.migrated-*.db /data/signals.db
+  || cp /data/signals.migrated-<STAMP>.db /data/signals.db
 ```
+
+`railway ssh` needs the Railway CLI logged in as you. The bot keeps writing
+to the old file until step 5 redeploys it, so do steps 2–5 back to back, in a
+quiet moment: rows written in between are not in the copy.
 
 4. If `/data/signals.db` already existed, stop. Compare row counts and
    decide which to keep; nothing is overwritten automatically.
@@ -306,7 +311,7 @@ Tag `pre-p1-2026-10-10` and local `main` `7d18b09` are untouched.
 
 ## 9. Final tests and scans (`06f2bd5`)
 
-- **Tests:** full suite 983 passed, 0 failed (system python 3.11.5, `.venv`).
+- **Tests:** full suite 983 passed, 0 failed (`.venv`, Python 3.11.5).
 - **Lint:** pyflakes clean on every new and changed file.
 - **Secret scan, tree:** the 65 files changed vs `origin/main` — 0 hits, no
   forbidden files.
