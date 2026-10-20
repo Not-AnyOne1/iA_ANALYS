@@ -30,6 +30,7 @@ from trade_accounting import account  # noqa: E402
 from trade_decision import decide_deterministically  # noqa: E402
 from trade_quality import effective_entry  # noqa: E402
 
+import strategy_variants  # noqa: E402
 from production_replay import Bars, ReplayProvider, service  # noqa: E402
 
 NET = Costs(0.30, 0.10, "assumed")
@@ -55,6 +56,7 @@ async def run(db: str):
     bars = Bars()
     provider = ReplayProvider(bars)
     builder = MarketContextBuilder(service(provider), news_filter=NewsFilter())
+    clean_builder = MarketContextBuilder(service(provider), news_filter=NewsFilter(), clean_candles=True)
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
     live_price = {r["message_id"]: r["price_at_decision"]
@@ -70,6 +72,10 @@ async def run(db: str):
         provider.at, provider.price = at, price
         ctx = await builder.build("XAUUSD", setup, now=at)
         trace = decide_deterministically(ctx)
+        variants = {v: strategy_variants.decide(ctx, v).verdict.value
+                    for v in strategy_variants.VARIANTS if v != "clean_data"}
+        variants["clean_data"] = decide_deterministically(
+            await clean_builder.build("XAUUSD", setup, now=at)).verdict.value
         outcome = None
         if setup.direction and setup.stop_loss is not None and setup.take_profits:
             r = account({"direction": setup.direction, "order_type": setup.order_type,
@@ -81,7 +87,8 @@ async def run(db: str):
                         at + timedelta(days=6), costs=NET)
             outcome = {"status": r.status, "r": r.r}
         out.append({"analysis_id": row["id"], "at": at.isoformat(), "direction": setup.direction,
-                    "price": price, "outcome": outcome, **context_facts(ctx, trace)})
+                    "price": price, "outcome": outcome, "variants": variants,
+                    **context_facts(ctx, trace)})
     return out
 
 
