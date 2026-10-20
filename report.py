@@ -474,7 +474,7 @@ def _score_text(decision) -> str:
     """The verdict's number as what it is: a 0-100 rule score. Never a
     percentage — nothing in this system is a calibrated probability."""
     score = _score(decision)
-    return "score: not scored" if score is None else f"score {score}/100"
+    return "setup score: not scored" if score is None else f"setup score {score}/100"
 
 
 def score_line(decision, context) -> str:
@@ -483,8 +483,14 @@ def score_line(decision, context) -> str:
     side names that side."""
     score = _score(decision)
     if score is None:
-        why = "blocked by the risk gate" if decision.risk_approved is False else "no score computed"
-        return f"🎯 <b>Setup score:</b> not scored ({why})"
+        if decision.risk_approved is False:
+            why = "blocked by the risk gate" + (
+                f": {decision.risk_rejections[0]}" if decision.risk_rejections else "")
+        else:
+            why = decision.decision_reason or "no score computed"
+        if len(why) > 90:
+            why = why[:89] + "…"
+        return f"🎯 <b>Setup score:</b> Not scored — {html.escape(why)}"
     scoring = getattr(context, "scoring", None)
     if decision.deterministic_score == 0 and scoring is not None and scoring.net_score:
         reads = "BUY" if scoring.net_score > 0 else "SELL"

@@ -162,9 +162,9 @@ _DASHBOARD_HTML = """\
 <h2>Confidence distribution</h2>
 <div id="chart"></div>
 <h2>Recent analyses</h2>
-<table id="recent"><thead><tr><th>Time</th><th>Symbol</th><th>Category</th><th>Confidence</th></tr></thead><tbody></tbody></table>
+<table id="recent"><thead><tr><th>Time</th><th>Symbol</th><th>Category</th><th>Parse confidence</th></tr></thead><tbody></tbody></table>
 <h2>Decision history</h2>
-<table id="decisions"><thead><tr><th>Time</th><th>Symbol</th><th>Verdict</th><th>Confidence</th></tr></thead><tbody></tbody></table>
+<table id="decisions"><thead><tr><th>Time</th><th>Symbol</th><th>Verdict</th><th>Setup score /100 (heuristic)</th></tr></thead><tbody></tbody></table>
 <h2>Signal timeline</h2>
 <table id="signals"><thead><tr><th>Time</th><th>Symbol</th><th>Direction</th><th>Summary</th></tr></thead><tbody></tbody></table>
 

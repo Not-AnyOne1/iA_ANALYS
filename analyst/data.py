@@ -181,19 +181,21 @@ def _minutes(delta: timedelta) -> str:
 # ------------------------------------------------------------------ labels
 
 def label_offset(coarse: Sequence[Candle], tf: Timeframe, m5_utc: Sequence[Candle],
-                 max_hours: int = 14, tolerance: float = 0.005) -> Optional[timedelta]:
+                 max_hours: int = 14, tolerance: float = 0.005,
+                 reference_tf: Timeframe = Timeframe.M5) -> Optional[timedelta]:
     """How far ``coarse``'s labels sit from UTC, measured against M5 bars
     known to be UTC-labelled.
 
     The live bot's provider labels candles in the account/exchange zone
     (measured +11 h) while calling them UTC. Only the labels differ — the
-    bars and their OHLC are identical — so the shift is found by matching:
+    bars and their OHLC are identical — so the shift is found by matching
+    (``m5_utc`` may be any UTC-labelled timeframe given as ``reference_tf``):
     for each candidate offset in 15-minute steps up to ``max_hours`` either
     way, count the ``coarse`` bars whose close equals the close of the M5
     bar ending at the same (shifted) instant. The answer must match at
     least 90% of at least 8 comparable bars, and no other offset may match
     half as well; otherwise ``None`` (the labels cannot be trusted)."""
-    closes = {c.timestamp + DURATION[Timeframe.M5]: c.close for c in m5_utc}
+    closes = {c.timestamp + DURATION[reference_tf]: c.close for c in m5_utc}
     dur = DURATION[tf]
     scores = []
     for k in range(-max_hours * 4, max_hours * 4 + 1):

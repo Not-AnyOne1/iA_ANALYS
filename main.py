@@ -20,6 +20,7 @@ import os
 import signal
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from claude_client import AnalysisError, ClaudeAnalyzer
@@ -65,6 +66,19 @@ TP2: 63500
 TP3: 65000
 Leverage: cross 10x
 """
+
+
+def storage_on_volume(path: Path) -> Optional[bool]:
+    """True/False when running on Railway with a volume attached (is the
+    database on it?); None when no volume is declared (local runs)."""
+    mount = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+    if not mount:
+        return None
+    try:
+        Path(path).resolve().relative_to(Path(mount).resolve())
+        return True
+    except ValueError:
+        return False
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -325,6 +339,19 @@ async def run_monitor(settings: Settings, formatter: Formatter) -> int:
             "(set TWELVE_DATA_API_KEY to enable live validation)"
         )
 
+    # Shadow work never touches the live provider: anything that compares a
+    # candle with the clock goes through one shared provider that asks for
+    # UTC-labelled candles. Created only if some shadow mode is on.
+    analyst_provider: Optional[TwelveDataProvider] = None
+    utc_market_data: Optional[MarketDataService] = None
+
+    def shared_utc_market_data() -> MarketDataService:
+        nonlocal analyst_provider, utc_market_data
+        if utc_market_data is None:
+            analyst_provider = TwelveDataProvider(settings.twelve_data_api_key, label_timezone="UTC")
+            utc_market_data = MarketDataService(analyst_provider, cache_ttl=settings.market_data_cache_ttl)
+        return utc_market_data
+
     # Independent analyst (analyst/), INDEPENDENT_ANALYSIS_MODE=shadow only.
     # Off by default: nothing below is constructed, no table is created and
     # no request is made. In shadow it records its own verdicts in its own
@@ -332,7 +359,6 @@ async def run_monitor(settings: Settings, formatter: Formatter) -> int:
     # verdict or what the bot sends.
     independent_analyst = None
     outcome_resolver = None
-    analyst_provider: Optional[TwelveDataProvider] = None
     if settings.independent_analysis_mode == "shadow":
         if storage is None or context_builder is None:
             log.warning(
@@ -347,21 +373,62 @@ async def run_monitor(settings: Settings, formatter: Formatter) -> int:
 
                 analyst_store = AnalystStore(settings.storage_db_path)
                 await analyst_store.initialize()
-                # Its own provider, asking for UTC-labelled candles; the live
-                # provider above is left exactly as it is.
-                analyst_provider = TwelveDataProvider(
-                    settings.twelve_data_api_key, label_timezone="UTC")
-                analyst_market_data = MarketDataService(
-                    analyst_provider, cache_ttl=settings.market_data_cache_ttl)
-                independent_analyst = ShadowAnalyst(analyst_market_data, analyst_store)
+                independent_analyst = ShadowAnalyst(shared_utc_market_data(), analyst_store)
                 outcome_resolver = OutcomeResolver(
-                    analyst_store, analyst_market_data, costs=independent_analyst.costs)
+                    analyst_store, shared_utc_market_data(), costs=independent_analyst.costs)
                 bot.attach_shadow_store(analyst_store)
                 log.info("independent_analysis_enabled mode=shadow "
                          "(records only; live verdicts and reports unchanged)")
             except Exception:  # noqa: BLE001 - the shadow analyst must never take down the monitor
                 log.exception("Failed to initialize the independent analyst — continuing without it")
                 independent_analyst = outcome_resolver = None
+
+    # Strategy shadow evaluation (strategy_shadow/), STRATEGY_SHADOW_MODE=on
+    # only. Off by default: nothing constructed, no table, no request. On, it
+    # judges each signal's live snapshot with the baseline replay and three
+    # candidates, records them write-once and tracks the signal's outcome;
+    # the live verdict and every message sent are unchanged.
+    strategy_shadow = None
+    strategy_resolver = None
+    strategy_store = None
+    on_volume = storage_on_volume(settings.storage_db_path)
+    if on_volume is False:
+        log.warning("storage_not_on_volume path=%s volume=%s — history will not survive a redeploy",
+                    settings.storage_db_path, os.getenv("RAILWAY_VOLUME_MOUNT_PATH"))
+    if settings.strategy_shadow_mode == "on" or settings.strategy_shadow_reporting == "on":
+        if storage is None or (settings.strategy_shadow_mode == "on" and context_builder is None):
+            log.warning("strategy_shadow_unavailable reason=%s",
+                        "storage unavailable" if storage is None else "no market data provider")
+        elif on_volume is False:
+            # Records written to container storage vanish on redeploy, which
+            # would silently bias the evaluation toward recent signals.
+            log.error("strategy_shadow_disabled reason=storage_not_on_volume path=%s",
+                      settings.storage_db_path)
+        else:
+            try:
+                from analyst.service import assumed_costs
+                from strategy_shadow.outcomes import StrategyOutcomeResolver
+                from strategy_shadow.service import StrategyShadow
+                from strategy_shadow.snapshot import LabelCalibrator
+                from strategy_shadow.store import StrategyShadowStore
+
+                strategy_store = StrategyShadowStore(settings.storage_db_path)
+                await strategy_store.initialize()
+                if settings.strategy_shadow_mode == "on":
+                    strategy_shadow = StrategyShadow(
+                        strategy_store, LabelCalibrator(shared_utc_market_data()),
+                        confirmation_start=settings.strategy_shadow_confirmation_start)
+                    strategy_resolver = StrategyOutcomeResolver(
+                        strategy_store, shared_utc_market_data(), costs=assumed_costs())
+                if settings.strategy_shadow_reporting == "on":
+                    bot.attach_strategy_shadow(strategy_store)
+                log.info("strategy_shadow mode=%s reporting=%s confirmation_start=%s "
+                         "(records only; live verdicts and reports unchanged)",
+                         settings.strategy_shadow_mode, settings.strategy_shadow_reporting,
+                         settings.strategy_shadow_confirmation_start)
+            except Exception:  # noqa: BLE001 - shadow evaluation must never take down the monitor
+                log.exception("Failed to initialize strategy shadow — continuing without it")
+                strategy_shadow = strategy_resolver = None
 
     stop = asyncio.Event()
     _install_signal_handlers(asyncio.get_running_loop(), stop)
@@ -399,14 +466,16 @@ async def run_monitor(settings: Settings, formatter: Formatter) -> int:
             market_data=market_data, structure_engine=structure_engine, smc_engine=smc_engine,
             scoring_engine=scoring_engine, decision_engine=decision_engine,
             context_builder=context_builder, trade_decision_engine=trade_decision_engine,
-            independent_analyst=independent_analyst,
+            independent_analyst=independent_analyst, strategy_shadow=strategy_shadow,
         ) as pipeline:
-            # Outside ``tasks`` on purpose: its ending must never be mistaken
+            # Outside ``tasks`` on purpose: their ending must never be mistaken
             # for the pipeline or the monitor ending.
-            resolver_task = (
-                asyncio.create_task(outcome_resolver.run_forever(), name="independent-outcomes")
-                if outcome_resolver is not None else None
-            )
+            resolver_tasks = [
+                asyncio.create_task(resolver.run_forever(), name=name)
+                for name, resolver in (("independent-outcomes", outcome_resolver),
+                                       ("strategy-shadow-outcomes", strategy_resolver))
+                if resolver is not None
+            ]
             tasks = {
                 asyncio.create_task(pipeline.run(), name="pipeline"),
                 asyncio.create_task(monitor.run_forever(), name="telegram"),
@@ -434,10 +503,10 @@ async def run_monitor(settings: Settings, formatter: Formatter) -> int:
             # Stop accepting new messages, then finish what is already queued.
             await monitor.stop()
             await pipeline.drain()
-            if resolver_task is not None:
+            for resolver_task in resolver_tasks:
                 resolver_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await resolver_task
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.gather(*resolver_tasks, return_exceptions=True)
 
             for task in pending:
                 task.cancel()

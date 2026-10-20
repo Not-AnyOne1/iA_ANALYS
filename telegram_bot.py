@@ -261,6 +261,7 @@ class TelegramBot:
         self._market_data: Optional[MarketDataService] = None
         self._statistics: Optional[Statistics] = None
         self._shadow_store = None
+        self._strategy_store = None
 
     def attach_storage(self, storage: Storage) -> None:
         """Give ``/latest`` and ``/history`` a persistent data source
@@ -300,6 +301,13 @@ class TelegramBot:
         :meth:`start`; without it the command is not registered at all."""
         self._shadow_store = store
 
+    def attach_strategy_shadow(self, store) -> None:
+        """Enable ``/strategy_shadow`` and ``/strategy_shadow_latest`` — the
+        strategy shadow comparison, pulled on request by the configured bot
+        chat only. Attach before :meth:`start`; without it neither command
+        is registered (STRATEGY_SHADOW_REPORTING=off)."""
+        self._strategy_store = store
+
     # ------------------------------------------------------------------ lifecycle
 
     async def start(self) -> None:
@@ -326,6 +334,10 @@ class TelegramBot:
             self._application.add_handler(CommandHandler(command, handler))
         if self._shadow_store is not None:
             self._application.add_handler(CommandHandler("shadow", self._cmd_shadow))
+        if self._strategy_store is not None:
+            self._application.add_handler(CommandHandler("strategy_shadow", self._cmd_strategy_shadow))
+            self._application.add_handler(
+                CommandHandler("strategy_shadow_latest", self._cmd_strategy_shadow_latest))
 
         await self._application.initialize()
         await self._application.start()
@@ -606,7 +618,7 @@ class TelegramBot:
                 lines.append(f"<b>R:R:</b> {rr:.2f}")
 
         lines.append(f"<b>Summary:</b> {_esc(analysis.summary)}")
-        lines.append(f"<b>Confidence:</b> {analysis.confidence_pct}%")
+        lines.append(f"<b>Parse confidence:</b> {analysis.confidence_pct}%")
         if analysis.missing_fields:
             lines.append(f"<b>Missing:</b> {_esc(', '.join(analysis.missing_fields))}")
         if analysis.notes:
@@ -833,6 +845,32 @@ class TelegramBot:
             await self._reply(update, "Shadow analysis is temporarily unavailable.")
             return
         await self._reply(update, card or "No shadow analysis recorded yet.")
+
+    async def _cmd_strategy_shadow(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_configured_chat(update) or self._strategy_store is None:
+            return
+        from strategy_shadow.report import build, render
+        try:
+            data = await self._strategy_store.load()
+            text = render(build(data), compact=True)
+        except Exception:  # noqa: BLE001 - a report failure must not break the bot
+            log.exception("bot_strategy_shadow_failed")
+            await self._reply(update, "Strategy shadow report is temporarily unavailable.")
+            return
+        await self._reply(update, "<pre>" + _esc(text[:3900]) + "</pre>")
+
+    async def _cmd_strategy_shadow_latest(self, update: Update,
+                                          context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_configured_chat(update) or self._strategy_store is None:
+            return
+        from strategy_shadow.report import render_latest
+        try:
+            text = render_latest(await self._strategy_store.load())
+        except Exception:  # noqa: BLE001 - a report failure must not break the bot
+            log.exception("bot_strategy_shadow_latest_failed")
+            await self._reply(update, "Strategy shadow report is temporarily unavailable.")
+            return
+        await self._reply(update, text[:4000] if text else "No strategy shadow evaluation recorded yet.")
 
     async def _cmd_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Manual, on-demand consumer of market_data.MarketDataService —

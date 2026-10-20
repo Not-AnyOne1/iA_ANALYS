@@ -83,9 +83,10 @@ class StatisticsSummary:
         lines = [f"{self.total_analyses} analysed · {self.total_signals} signals"]
 
         if self.average_signal_confidence is not None:
-            lines.append(f"Avg signal confidence: {self.average_signal_confidence * 100:.0f}%")
+            lines.append(f"Avg parse confidence: {self.average_signal_confidence * 100:.0f}%")
         if self.average_decision_confidence is not None:
-            lines.append(f"Avg decision confidence: {self.average_decision_confidence:.0f}%")
+            lines.append(f"Avg setup score: {self.average_decision_confidence:.0f}/100 "
+                         "(heuristic, not a win probability)")
 
         lines.append(
             "Verdicts: " + (

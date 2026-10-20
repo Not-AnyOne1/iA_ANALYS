@@ -204,7 +204,12 @@ def test_the_card_shows_a_labelled_score_never_a_percentage():
     card = render_telegram_report(ctx, decision())
     assert f"Setup score:</b> {trace.adjusted_score}/100 (heuristic, not a win probability)" in card
     assert "%" not in card.split("Setup score")[1].split("\n")[0]
-    blocked = score_line(decision(adjusted_score=None, confidence=0, risk_approved=False), ctx)
-    assert "not scored (blocked by the risk gate)" in blocked and "0" not in blocked.split("</b>")[1]
+    blocked = score_line(decision(adjusted_score=None, confidence=0, risk_approved=False,
+                                  risk_rejections=["risk_reward: R:R 0.80 is below 1.10"]), ctx)
+    assert "Setup score:</b> Not scored — blocked by the risk gate: risk_reward" in blocked
+    assert "/100" not in blocked and "%" not in blocked
+    unscored = score_line(decision(adjusted_score=None, confidence=0,
+                                   decision_reason="no deterministic score could be computed"), ctx)
+    assert unscored.endswith("Not scored — no deterministic score could be computed")
     against = score_line(decision(deterministic_score=0, adjusted_score=5, confidence=5), ctx)
     assert "5/100 — engine reads BUY" in against

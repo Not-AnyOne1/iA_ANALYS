@@ -13,8 +13,9 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 from dotenv import load_dotenv
 
@@ -31,6 +32,7 @@ _USERNAME_RE = re.compile(
 # RFC-001: how the regex-first parser interacts with the Claude fallback.
 _VALID_PARSER_MODES = {"shadow", "active", "off"}
 _VALID_INDEPENDENT_MODES = {"off", "shadow"}
+_VALID_ON_OFF = {"off", "on"}
 
 
 class ConfigError(RuntimeError):
@@ -174,6 +176,17 @@ class Settings:
     # the bot sends. There is deliberately no live mode.
     independent_analysis_mode: str = "off"
 
+    # --- Strategy shadow evaluation (strategy_shadow/) -----------------------
+    # "on": every XAUUSD signal's live snapshot is also judged by the
+    # baseline replay and three candidate strategies, recorded write-once,
+    # and its outcome tracked. Never changes the live verdict or what is sent.
+    # Reporting "on" registers the admin-only /strategy_shadow commands.
+    strategy_shadow_mode: str = "off"
+    strategy_shadow_reporting: str = "off"
+    # Signals on/after this UTC date are recorded in the "confirmation"
+    # cohort, which the report keeps hidden unless explicitly opened.
+    strategy_shadow_confirmation_start: Optional[date] = None
+
     @classmethod
     def load(cls, env_file: str | os.PathLike[str] | None = ".env") -> "Settings":
         """Read ``.env`` (if present) plus the process environment."""
@@ -202,6 +215,20 @@ class Settings:
                 f"INDEPENDENT_ANALYSIS_MODE must be one of {sorted(_VALID_INDEPENDENT_MODES)}, "
                 f"got {independent_mode!r}"
             )
+
+        shadow_flags = {}
+        for name in ("STRATEGY_SHADOW_MODE", "STRATEGY_SHADOW_REPORTING"):
+            value = _optional(name, "off").lower()
+            if value not in _VALID_ON_OFF:
+                raise ConfigError(f"{name} must be one of {sorted(_VALID_ON_OFF)}, got {value!r}")
+            shadow_flags[name] = value
+        confirmation_raw = _optional("STRATEGY_SHADOW_CONFIRMATION_START")
+        try:
+            confirmation_start = date.fromisoformat(confirmation_raw) if confirmation_raw else None
+        except ValueError as exc:
+            raise ConfigError(
+                f"STRATEGY_SHADOW_CONFIRMATION_START must be a YYYY-MM-DD date, got {confirmation_raw!r}"
+            ) from exc
 
         market_data_timeframe_raw = _optional("MARKET_DATA_TIMEFRAME", "H1").upper()
         if market_data_timeframe_raw not in Timeframe.__members__:
@@ -240,6 +267,9 @@ class Settings:
             market_data_cache_ttl=float(_optional("MARKET_DATA_CACHE_TTL", "30")),
             market_data_timeframe=Timeframe[market_data_timeframe_raw],
             independent_analysis_mode=independent_mode,
+            strategy_shadow_mode=shadow_flags["STRATEGY_SHADOW_MODE"],
+            strategy_shadow_reporting=shadow_flags["STRATEGY_SHADOW_REPORTING"],
+            strategy_shadow_confirmation_start=confirmation_start,
         )
 
     @property

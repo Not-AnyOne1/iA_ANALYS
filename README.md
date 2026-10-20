@@ -745,6 +745,39 @@ Backtest: `python research/analyst_backtest.py --help`.
 
 ---
 
+## Strategy shadow evaluation
+
+`strategy_shadow/` answers one question with forward-collected signals:
+which ENTER/SKIP strategy decides better? With `STRATEGY_SHADOW_MODE=on`,
+after the live report is sent, every XAUUSD signal's live snapshot (the very
+`MarketContext` the live verdict used) is judged by:
+
+| Strategy | Rule (`strategy_variants.py`) |
+| --- | --- |
+| `baseline` | production's `decide_deterministically`, replayed and checked against the live verdict |
+| `htf_regime` | direction from H4 and H1 bias agreement (last BOS/CHoCH + EMA-50 side) |
+| `valid_events` | the H1 vote without stale or invalidated BOS/CHoCH/order-block/zone votes |
+| `range_filter` | SKIP when H1 is ranging and its ADX is below 20 |
+
+One row per signal is written once (idempotent on chat and message id;
+triggers refuse UPDATE and DELETE), with the snapshot fingerprint, data
+quality, code version and rules hash. The original signal's trade is
+tracked whatever any strategy said (P1 accounting, gross and net), so every
+strategy is judged on the same outcomes. Corrections are new revisions.
+
+Extra Twelve Data use: none for the decisions; one small UTC calibration at
+most every 6 hours and at most one M15 request every 30 minutes while
+outcomes are pending. Report: `python research/strategy_shadow_report.py
+--db <copy of signals.db>`; in Telegram, `/strategy_shadow` and
+`/strategy_shadow_latest` for the configured chat when
+`STRATEGY_SHADOW_REPORTING=on`. Results are labelled experimental, with
+sample-size warnings; nothing is a trade instruction.
+
+On Railway, strategy shadow refuses to start unless `STORAGE_DB_PATH` lies on
+the attached volume (`RAILWAY_VOLUME_MOUNT_PATH`).
+
+---
+
 ## Configuration reference
 
 All values live in `.env`; real environment variables take precedence.
@@ -782,6 +815,9 @@ All values live in `.env`; real environment variables take precedence.
 | `INDEPENDENT_ANALYSIS_MODE` | `off` | `off` \| `shadow` — see "Independent analyst (shadow)" above. There is no live mode |
 | `ANALYST_MIN_RR` | `1.5` | Shadow analyst: net reward-to-risk minimum for its own proposals |
 | `ANALYST_SIGNAL_MIN_RR` | `1.0` | Shadow analyst: net reward-to-risk minimum for the original signal |
+| `STRATEGY_SHADOW_MODE` | `off` | `off` \| `on` — see "Strategy shadow evaluation" above |
+| `STRATEGY_SHADOW_REPORTING` | `off` | `off` \| `on` — admin-only `/strategy_shadow`, `/strategy_shadow_latest` |
+| `STRATEGY_SHADOW_CONFIRMATION_START` | *(unset)* | `YYYY-MM-DD`; later signals form the hidden confirmation cohort |
 
 Analysis output goes to **stdout**, logs go to **stderr**, so
 `python main.py > signals.txt` keeps a clean transcript while errors stay

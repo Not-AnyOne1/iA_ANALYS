@@ -51,12 +51,17 @@ from trade_decision import TradeDecisionEngine
 
 if TYPE_CHECKING:
     from analyst.service import ShadowAnalyst
+    from strategy_shadow.service import StrategyShadow
 
 log = logging.getLogger(__name__)
 
 # Upper bound on the shadow analyst's work per signal (one M5 request plus
 # pure computation); it runs after the live report, never before it.
 _SHADOW_TIMEOUT_SECONDS = 60.0
+# Upper bound on shadow tasks in flight at once (independent analyst and
+# strategy shadow together). Beyond it a shadow evaluation is dropped and
+# logged rather than queued: the live path never waits for shadow work.
+_MAX_SHADOW_TASKS = 16
 
 
 @dataclass
@@ -116,6 +121,7 @@ class AnalysisPipeline:
         trade_decision_engine: Optional["TradeDecisionEngine"] = None,
         emit_reports: bool = True,
         independent_analyst: Optional["ShadowAnalyst"] = None,
+        strategy_shadow: Optional["StrategyShadow"] = None,
     ) -> None:
         self._settings = settings
         self._queue = queue
@@ -134,7 +140,10 @@ class AnalysisPipeline:
         # INDEPENDENT_ANALYSIS_MODE=shadow only; None (the default) runs
         # nothing extra at all.
         self._independent_analyst = independent_analyst
+        # STRATEGY_SHADOW_MODE=on only; None (the default) runs nothing extra.
+        self._strategy_shadow = strategy_shadow
         self._independent_tasks: set = set()
+        self.shadow_dropped = 0
         self._print_lock = asyncio.Lock()
         self._jsonl: TextIO | None = None
         self.stats = Stats()
@@ -324,29 +333,38 @@ class AnalysisPipeline:
                 context.risk.approved if context.risk else None,
             )
 
-        # Shadow analyst, started only after the live verdict was decided,
-        # rendered and sent, and run as a separate task so it cannot delay
+        # Shadow work, started only after the live verdict was decided,
+        # rendered and sent, and run as separate tasks so it cannot delay
         # the storage write below or anything else on the live path.
-        if self._independent_analyst is not None:
-            task = asyncio.create_task(
-                self._run_independent(message, analysis, context, decision),
-                name=f"independent-analysis-{message.id}",
-            )
-            self._independent_tasks.add(task)
-            task.add_done_callback(self._independent_tasks.discard)
+        for name, shadow in (("independent-analysis", self._independent_analyst),
+                             ("strategy-shadow", self._strategy_shadow)):
+            if shadow is not None:
+                self._spawn_shadow(name, shadow, message, analysis, context, decision)
 
         return context.structure, context.smc, decision
 
-    async def _run_independent(self, message, analysis, context, decision) -> None:
+    def _spawn_shadow(self, name, shadow, message, analysis, context, decision) -> None:
+        if len(self._independent_tasks) >= _MAX_SHADOW_TASKS:
+            self.shadow_dropped += 1
+            log.warning("shadow_task_dropped kind=%s message_id=%s in_flight=%d",
+                        name, message.id, len(self._independent_tasks))
+            return
+        task = asyncio.create_task(
+            self._run_shadow(name, shadow, message, analysis, context, decision),
+            name=f"{name}-{message.id}",
+        )
+        self._independent_tasks.add(task)
+        task.add_done_callback(self._independent_tasks.discard)
+
+    async def _run_shadow(self, name, shadow, message, analysis, context, decision) -> None:
         """Bounded in time; any failure is logged and dropped."""
-        assert self._independent_analyst is not None
         try:
             await asyncio.wait_for(
-                self._independent_analyst.on_signal(message, analysis, context, decision),
+                shadow.on_signal(message, analysis, context, decision),
                 timeout=_SHADOW_TIMEOUT_SECONDS,
             )
-        except Exception:  # noqa: BLE001 - the shadow analyst must never break the pipeline
-            log.exception("Independent analysis failed for message %s", message.id)
+        except Exception:  # noqa: BLE001 - shadow work must never break the pipeline
+            log.exception("Shadow task %s failed for message %s", name, message.id)
 
     async def _enrich(
         self, message: IncomingMessage, analysis: SignalAnalysis
