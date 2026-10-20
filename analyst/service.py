@@ -31,7 +31,7 @@ from market_data import MarketDataError, MarketDataService, Timeframe
 from models import TradeSetup
 from trade_quality import effective_entry
 
-from analyst.data import TIMEFRAMES, label_offset, relabel
+from analyst.data import TIMEFRAMES, label_offset, m5_request, relabel
 from analyst.engine import Analysis, analyse
 from analyst.report import render_card
 from analyst.rules import Rules
@@ -162,7 +162,7 @@ class ShadowAnalyst:
         candles: Dict[Timeframe, Any] = {tf: None for tf in TIMEFRAMES}
         offset_minutes = None
         try:
-            m5 = await self._market_data.get_candles(SYMBOL, Timeframe.M5, rules.m5_limit)
+            m5 = await self._market_data.get_candles(SYMBOL, Timeframe.M5, m5_request(rules.m5_limit))
             candles[Timeframe.M5] = m5.candles
         except MarketDataError as exc:
             log.info("analyst_m5_unavailable message_id=%s error=%s", message.id, exc)

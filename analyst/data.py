@@ -11,7 +11,10 @@ Rules, each a pure function of the candles and the analysis time ``as_of``:
    multiple of 5 minutes, M15 of 15, H1 on the hour, H4 on the hour at
    00/04/... or 01/05/... UTC — the provider's H4 grid follows New York time
    and moves an hour with daylight saving).
-4. Enough history: H4 >= 60 bars, H1 >= 100, M15 >= 100, M5 >= 60.
+4. Enough history: H4 >= 60 bars, H1 >= 100, M15 >= 100, M5 >= 60; and at
+   most the last ``WINDOW`` (300) real bars are used, however many the
+   request returned — so a request padded for weekend stubs (``m5_request``)
+   analyses exactly the bars an unpadded week-day request would.
 5. Fresh. The last closed bar must have closed within a lag measured in
    trading time, so the weekly closure does not count against it: M5 15 min,
    M15 45 min, H1 2 h, H4 8 h.
@@ -31,8 +34,8 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Dict, Iterable, Iterator, Optional, Sequence, Tuple
 
 from market_data import Candle, Timeframe
-from market_hours import bar_inside_weekly_closure, follows_weekly_session, in_weekly_closure, \
-    new_york_offset
+from market_hours import bar_inside_weekly_closure, closure_allowance, follows_weekly_session, \
+    in_weekly_closure, new_york_offset
 
 from analyst.rules import Rules
 
@@ -46,6 +49,7 @@ DURATION: Dict[Timeframe, timedelta] = {
 MIN_BARS: Dict[Timeframe, int] = {
     Timeframe.H4: 60, Timeframe.H1: 100, Timeframe.M15: 100, Timeframe.M5: 60,
 }
+WINDOW = 300
 MAX_LAG: Dict[Timeframe, timedelta] = {
     Timeframe.M5: timedelta(minutes=15), Timeframe.M15: timedelta(minutes=45),
     Timeframe.H1: timedelta(hours=2), Timeframe.H4: timedelta(hours=8),
@@ -149,7 +153,7 @@ def prepare_frame(candles: Optional[Sequence[Candle]], tf: Timeframe, as_of: dat
                   symbol: str) -> Frame:
     if candles is None:
         return Frame(tf, (), "unavailable", f"{tf.value} candles unavailable")
-    bars = drop_closure_stubs(closed_bars(candles, tf, as_of), tf, symbol)
+    bars = drop_closure_stubs(closed_bars(candles, tf, as_of), tf, symbol)[-WINDOW:]
     off = [c.timestamp for c in bars if not on_grid(c.timestamp, tf)]
     if off:
         return Frame(tf, bars, "off_grid", f"{tf.value} bar off its grid at {off[0].isoformat()}")
@@ -161,6 +165,13 @@ def prepare_frame(candles: Optional[Sequence[Candle]], tf: Timeframe, as_of: dat
         return Frame(tf, bars, "stale", f"{tf.value} last bar closed {_minutes(lag)} of trading "
                                         f"time ago (limit {_minutes(MAX_LAG[tf])})")
     return Frame(tf, bars, "ok")
+
+
+def m5_request(bars: int = WINDOW) -> int:
+    """M5 bars to request so ``bars`` real ones survive a weekend: the
+    provider serves a stub for every M5 slot of the closure (588 a weekend,
+    measured), so an unpadded request on a Monday morning is mostly stubs."""
+    return min(5000, bars + closure_allowance(DURATION[Timeframe.M5], bars))
 
 
 def _minutes(delta: timedelta) -> str:

@@ -160,3 +160,17 @@ def test_an_unprovable_offset_is_refused():
     assert label_offset(frames[Timeframe.M15], Timeframe.M15, []) is None
     noisy = [replace(b, close=b.close + 0.37) for b in frames[Timeframe.M15]]
     assert label_offset(noisy, Timeframe.M15, frames[Timeframe.M5]) is None
+
+
+def test_a_padded_request_survives_the_weekend_and_is_trimmed_to_300():
+    from analyst.data import WINDOW, m5_request
+    from market_hours import bar_inside_weekly_closure
+    monday = datetime(2026, 7, 6, 1, 0, tzinfo=UTC)               # 3 h after the Sunday reopen
+    n = m5_request()
+    bars = run(Timeframe.M5, monday - timedelta(minutes=5 * n), n)    # stubs in every closure slot
+    stubs = sum(bar_inside_weekly_closure(b.timestamp, DURATION[Timeframe.M5]) for b in bars)
+    assert stubs == 588
+    unpadded = prepare_frame(bars[-300:], Timeframe.M5, monday, "XAUUSD")
+    padded = prepare_frame(bars, Timeframe.M5, monday, "XAUUSD")
+    assert unpadded.status == "insufficient"
+    assert padded.status == "ok" and len(padded.candles) == WINDOW

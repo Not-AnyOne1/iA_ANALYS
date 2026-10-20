@@ -53,7 +53,7 @@ class Rules:
     # Data
     price_sanity_pct: float = 0.5        # live price within 0.5% of the last M5 close
     alignment_pct: float = 0.05          # same-instant closes on two timeframes within 0.05%
-    m5_limit: int = 300                  # M5 bars requested (25 hours)
+    m5_limit: int = 300                  # real M5 bars wanted; the request is padded for stubs
 
     @classmethod
     def from_env(cls) -> "Rules":
