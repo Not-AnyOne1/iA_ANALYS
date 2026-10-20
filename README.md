@@ -707,6 +707,44 @@ avoid leaking pipeline details to anyone else who messages the bot):
 
 ---
 
+## Independent analyst (shadow)
+
+`analyst/` reads XAUUSD itself on four timeframes and judges each signal
+against what it finds, without trusting the signal's direction. It runs only
+with `INDEPENDENT_ANALYSIS_MODE=shadow` and never changes the live verdict,
+the live report or what the bot sends.
+
+| Timeframe | Role | Rule (closed bars only) |
+| --- | --- | --- |
+| H4 | context | bias = direction of the last BOS/CHoCH when the close is on that side of EMA-50, else neutral |
+| H1 | directional bias | the same rule |
+| M15 | setup | B: a 38.2-100% pullback into the last impulse leg; C: a sweep of resting liquidity that closed back |
+| M5 | entry | a BOS/CHoCH in the trade's direction after the setup's extreme, within the last hour |
+
+Strategy **B** (trend continuation) needs H4 and H1 aligned; strategy **C**
+(liquidity-sweep reversal) does not. They are separate hypotheses, tracked
+separately, never merged or ranked by results. Stops sit beyond the
+invalidation extreme (0.2 M15 ATR buffer, 0.5-4 ATR band); targets are the
+nearest resting liquidity, never moved to improve the ratio; ratios are net of
+spread and slippage.
+
+Each signal gets **ENTER / WAIT / SKIP / NO TRADE** with reason codes (see
+`analyst/verdict.py`), and an evidence count ("4/6 checks met") that is
+labelled uncalibrated — it is not a win probability. Stale, missing,
+misaligned data or a closed market is NO TRADE.
+
+In shadow mode one row per signal goes to `independent_analyses` in
+`STORAGE_DB_PATH` (write-once: triggers refuse UPDATE and DELETE), and final
+outcomes of the signal and of every READY proposal go to
+`independent_outcomes`. Extra Twelve Data use: one M5 request per signal and
+at most one M15 request every 30 minutes while outcomes are pending. The
+configured bot chat (`TELEGRAM_BOT_CHAT_ID`) can pull the latest card with
+`/shadow`; nothing is pushed.
+
+Backtest: `python research/analyst_backtest.py --help`.
+
+---
+
 ## Configuration reference
 
 All values live in `.env`; real environment variables take precedence.
@@ -741,6 +779,9 @@ All values live in `.env`; real environment variables take precedence.
 | `JSONL_OUTPUT` | — | Append structured results, one JSON object per line |
 | `COLOR_OUTPUT` | `true` | ANSI colour (also honours `NO_COLOR`) |
 | `SHOW_JSON` | `true` | Print the JSON block under each panel |
+| `INDEPENDENT_ANALYSIS_MODE` | `off` | `off` \| `shadow` — see "Independent analyst (shadow)" above. There is no live mode |
+| `ANALYST_MIN_RR` | `1.5` | Shadow analyst: net reward-to-risk minimum for its own proposals |
+| `ANALYST_SIGNAL_MIN_RR` | `1.0` | Shadow analyst: net reward-to-risk minimum for the original signal |
 
 Analysis output goes to **stdout**, logs go to **stderr**, so
 `python main.py > signals.txt` keeps a clean transcript while errors stay

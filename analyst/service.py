@@ -3,8 +3,12 @@
 ``pipeline.py`` calls :meth:`ShadowAnalyst.on_signal` once per signal, after
 the live verdict has been decided, rendered and sent — so nothing here can
 delay or change what the bot already did. It reuses the M15/H1/H4 candles
-the live context fetched (no extra requests) and fetches only M5, then
-writes one row to the analyst's own write-once table. It sends nothing to
+the live context fetched (no extra requests) and fetches only M5, through
+its own provider that asks for UTC labels. The live provider labels candles
+in the account zone (measured +11 h) while calling them UTC; the shift is
+measured against the M5 bars (``analyst.data.label_offset``) and undone, or
+the verdict is NO TRADE. The live provider itself is left exactly as it is.
+One row goes to the analyst's own write-once table. Nothing is sent to
 Telegram; the latest card can be pulled with ``/shadow`` from the
 configured bot chat.
 
@@ -27,7 +31,7 @@ from market_data import MarketDataError, MarketDataService, Timeframe
 from models import TradeSetup
 from trade_quality import effective_entry
 
-from analyst.data import TIMEFRAMES
+from analyst.data import TIMEFRAMES, label_offset, relabel
 from analyst.engine import Analysis, analyse
 from analyst.report import render_card
 from analyst.rules import Rules
@@ -94,7 +98,8 @@ def _jsonable(value):
 
 def analysis_row(a: Analysis, setup: TradeSetup, *, chat_id: int, message_id: int, message_at,
                  live_verdict: Optional[str], live_confidence: Optional[int], card: str,
-                 rules: Rules, mode: str = "shadow") -> Dict[str, Any]:
+                 rules: Rules, mode: str = "shadow",
+                 label_offset_minutes: Optional[int] = None) -> Dict[str, Any]:
     v = a.verdict
     detail = {
         "context": a.context, "biases": a.biases, "m15_setup": a.m15_setup,
@@ -108,6 +113,7 @@ def analysis_row(a: Analysis, setup: TradeSetup, *, chat_id: int, message_id: in
                       for name, sides in a.proposals.items()},
         "headline": [a.headline.strategy, a.headline.direction] if a.headline else None,
         "rules": _jsonable(asdict(rules)),
+        "live_label_offset_minutes": label_offset_minutes,
     }
     return {
         "created_at": a.as_of.isoformat(), "chat_id": chat_id, "message_id": message_id,
@@ -151,15 +157,29 @@ class ShadowAnalyst:
     async def _analyse(self, message, setup: TradeSetup, context, live_decision) -> Analysis:
         rules, costs = self._rules, self._costs
         as_of = context.generated_at
-        candles: Dict[Timeframe, Any] = {
-            tf: series.candles for tf, series in getattr(context, "candle_series", {}).items()
-            if tf in TIMEFRAMES}
+        live_series = {tf: series.candles for tf, series in getattr(context, "candle_series", {}).items()
+                       if tf in TIMEFRAMES}
+        candles: Dict[Timeframe, Any] = {tf: None for tf in TIMEFRAMES}
+        offset_minutes = None
         try:
             m5 = await self._market_data.get_candles(SYMBOL, Timeframe.M5, rules.m5_limit)
             candles[Timeframe.M5] = m5.candles
         except MarketDataError as exc:
             log.info("analyst_m5_unavailable message_id=%s error=%s", message.id, exc)
-            candles[Timeframe.M5] = None
+        m15 = live_series.get(Timeframe.M15)
+        if candles[Timeframe.M5] and m15:
+            # The live context's candles are labelled in the provider's
+            # account zone; find the shift against the UTC-labelled M5 bars
+            # and undo it. Unprovable shift -> those timeframes stay missing
+            # and the verdict is NO TRADE.
+            delta = label_offset(m15, Timeframe.M15, candles[Timeframe.M5])
+            if delta is not None:
+                offset_minutes = int(delta.total_seconds() // 60)
+                for tf in (Timeframe.M15, Timeframe.H1, Timeframe.H4):
+                    if live_series.get(tf):
+                        candles[tf] = relabel(live_series[tf], delta)
+            else:
+                log.warning("analyst_label_offset_unknown message_id=%s", message.id)
         recent = await self._store.recent_signals(
             SYMBOL, as_of - rules.duplicate_window - rules.signal_max_age)
         a = analyse(SYMBOL, setup, message.timestamp, as_of, context.current_price, candles, rules,
@@ -169,7 +189,8 @@ class ShadowAnalyst:
         card = render_card(a, setup, live_verdict=live_verdict)
         row = analysis_row(a, setup, chat_id=message.chat_id, message_id=message.id,
                            message_at=message.timestamp, live_verdict=live_verdict,
-                           live_confidence=live_confidence, card=card, rules=rules)
+                           live_confidence=live_confidence, card=card, rules=rules,
+                           label_offset_minutes=offset_minutes)
         analysis_id = await self._store.record(row)
         log.info("independent_analysis message_id=%s verdict=%s reasons=%s data=%s headline=%s "
                  "live_verdict=%s recorded=%s", message.id, a.verdict.verdict, row["reason_codes"],

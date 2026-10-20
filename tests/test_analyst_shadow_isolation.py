@@ -187,3 +187,50 @@ def test_shadow_command_answers_only_the_configured_chat(tmp_path):
     asyncio.run(bot._cmd_shadow(subscriber, None))
     assert owner.message.reply_text.await_args.args[0] == "No shadow analysis recorded yet."
     assert subscriber.message.reply_text.await_count == 0
+
+
+# ------------------------------------------------- live labels, end to end
+
+def test_the_service_undoes_the_live_label_offset(tmp_path):
+    """The live context carries account-zone labels (+11 h); the analyst's
+    own M5 is UTC. The shift is found and undone, so the analysis is fresh."""
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    from market_data import CandleSeries
+    from analyst.data import relabel
+    from analyst_synth import scenario
+    from models import SignalAnalysis, TradeSetup
+    from telegram_client import IncomingMessage
+
+    _, frames, as_of, price = scenario("b_long")
+    shift = timedelta(hours=11)
+
+    class UtcM5:
+        name = "test"
+
+        async def get_quote(self, symbol):
+            raise AssertionError("the analyst never asks for a quote")
+
+        async def get_candles(self, symbol, timeframe, limit):
+            assert timeframe is Timeframe.M5
+            return CandleSeries(symbol, timeframe, "test", frames[Timeframe.M5])
+
+    live = {tf: CandleSeries("XAUUSD", tf, "test", relabel(frames[tf], -shift))
+            for tf in (Timeframe.M15, Timeframe.H1, Timeframe.H4)}
+    context = SimpleNamespace(generated_at=as_of, candle_series=live, current_price=price, news=None)
+    store = AnalystStore(tmp_path / "x.db")
+    asyncio.run(store.initialize())
+    analyst = ShadowAnalyst(MarketDataService(UtcM5()), store)
+    analysis = SignalAnalysis(is_signal=True, category="signal", summary="TEST DATA", confidence=0.9,
+                              missing_fields=[], notes=None, source="regex",
+                              setup=TradeSetup(symbol="XAUUSD", direction="long", order_type="market",
+                                               stop_loss=2353.0, take_profits=[2372.0]))
+    message = IncomingMessage(id=1, chat_id=-1, chat_title="t", sender="t",
+                              timestamp=as_of - timedelta(seconds=30), text="TEST")
+    decision = SimpleNamespace(verdict=SimpleNamespace(value="SKIP"), confidence=0)
+    a = asyncio.run(analyst.on_signal(message, analysis, context, decision))
+    assert a.data_status == "fresh" and a.verdict.verdict == "ENTER"
+    con = sqlite3.connect(tmp_path / "x.db")
+    detail = con.execute("SELECT analysis_json FROM independent_analyses").fetchone()[0]
+    assert '"live_label_offset_minutes": 660' in detail

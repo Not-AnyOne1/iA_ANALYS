@@ -137,3 +137,26 @@ def test_weekly_closure_is_market_closed():
     _, frames, _, price = scenario("b_long")
     view = build_view("XAUUSD", datetime(2026, 3, 21, 12, tzinfo=UTC), price, frames, Rules())
     assert view.status == "market_closed"
+
+
+# ------------------------------------------------------------------ labels
+
+def test_the_live_label_offset_is_measured_and_undone():
+    from analyst.data import label_offset, relabel
+    _, frames, as_of, price = scenario("b_long")
+    shift = timedelta(hours=11)
+    m15_live = relabel(frames[Timeframe.M15], -shift)          # labelled 11 h ahead, as measured live
+    assert label_offset(m15_live, Timeframe.M15, frames[Timeframe.M5]) == shift
+    assert relabel(m15_live, shift) == frames[Timeframe.M15]
+    assert label_offset(frames[Timeframe.M15], Timeframe.M15, frames[Timeframe.M5]) == timedelta(0)
+
+
+def test_an_unprovable_offset_is_refused():
+    from analyst.data import label_offset
+    _, frames, _, _ = scenario("b_long")
+    flat = [replace(b, close=2000.0) for b in frames[Timeframe.M15]]
+    flat_m5 = [replace(b, close=2000.0) for b in frames[Timeframe.M5]]
+    assert label_offset(flat, Timeframe.M15, flat_m5) is None          # every offset matches: ambiguous
+    assert label_offset(frames[Timeframe.M15], Timeframe.M15, []) is None
+    noisy = [replace(b, close=b.close + 0.37) for b in frames[Timeframe.M15]]
+    assert label_offset(noisy, Timeframe.M15, frames[Timeframe.M5]) is None

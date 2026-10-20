@@ -370,9 +370,16 @@ class TwelveDataProvider:
     # "symbol not found" MarketDataError rather than a special case.
     _CURRENCY_STYLE_RE = re.compile(r"^[A-Z]{6}$")
 
-    def __init__(self, api_key: str, *, timeout: float = 10.0, client: Optional[httpx.AsyncClient] = None) -> None:
+    def __init__(self, api_key: str, *, timeout: float = 10.0, client: Optional[httpx.AsyncClient] = None,
+                 label_timezone: Optional[str] = None) -> None:
         self._api_key = api_key
         self._client = client or httpx.AsyncClient(base_url=self._BASE_URL, timeout=timeout)
+        # Unset (the live bot's provider): candles come back labelled in the
+        # account/exchange zone, exactly as before. "UTC" asks Twelve Data to
+        # label them in UTC — same bars, same OHLC, only the labels move
+        # (measured). Used by the shadow analyst, which compares candles with
+        # the clock.
+        self._label_timezone = label_timezone
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -404,7 +411,8 @@ class TwelveDataProvider:
         interval = self._INTERVAL_MAP[timeframe]
         data = await self._request(
             "/time_series",
-            {"symbol": self._normalize_symbol(symbol), "interval": interval, "outputsize": limit},
+            {"symbol": self._normalize_symbol(symbol), "interval": interval, "outputsize": limit,
+             **({"timezone": self._label_timezone} if self._label_timezone else {})},
         )
 
         values = data.get("values")

@@ -332,6 +332,7 @@ async def run_monitor(settings: Settings, formatter: Formatter) -> int:
     # verdict or what the bot sends.
     independent_analyst = None
     outcome_resolver = None
+    analyst_provider: Optional[TwelveDataProvider] = None
     if settings.independent_analysis_mode == "shadow":
         if storage is None or context_builder is None:
             log.warning(
@@ -346,9 +347,15 @@ async def run_monitor(settings: Settings, formatter: Formatter) -> int:
 
                 analyst_store = AnalystStore(settings.storage_db_path)
                 await analyst_store.initialize()
-                independent_analyst = ShadowAnalyst(market_data, analyst_store)
+                # Its own provider, asking for UTC-labelled candles; the live
+                # provider above is left exactly as it is.
+                analyst_provider = TwelveDataProvider(
+                    settings.twelve_data_api_key, label_timezone="UTC")
+                analyst_market_data = MarketDataService(
+                    analyst_provider, cache_ttl=settings.market_data_cache_ttl)
+                independent_analyst = ShadowAnalyst(analyst_market_data, analyst_store)
                 outcome_resolver = OutcomeResolver(
-                    analyst_store, market_data, costs=independent_analyst.costs)
+                    analyst_store, analyst_market_data, costs=independent_analyst.costs)
                 bot.attach_shadow_store(analyst_store)
                 log.info("independent_analysis_enabled mode=shadow "
                          "(records only; live verdicts and reports unchanged)")
@@ -441,6 +448,9 @@ async def run_monitor(settings: Settings, formatter: Formatter) -> int:
 
         return exit_code
     finally:
+        if analyst_provider is not None:
+            with contextlib.suppress(Exception):
+                await analyst_provider.aclose()
         await _shutdown(
             monitor=monitor, bot=bot, storage=storage,
             market_data_provider=market_data_provider,

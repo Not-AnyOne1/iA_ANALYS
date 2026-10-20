@@ -167,6 +167,52 @@ def _minutes(delta: timedelta) -> str:
     return f"{delta.total_seconds() / 60:.0f} min"
 
 
+# ------------------------------------------------------------------ labels
+
+def label_offset(coarse: Sequence[Candle], tf: Timeframe, m5_utc: Sequence[Candle],
+                 max_hours: int = 14, tolerance: float = 0.005) -> Optional[timedelta]:
+    """How far ``coarse``'s labels sit from UTC, measured against M5 bars
+    known to be UTC-labelled.
+
+    The live bot's provider labels candles in the account/exchange zone
+    (measured +11 h) while calling them UTC. Only the labels differ — the
+    bars and their OHLC are identical — so the shift is found by matching:
+    for each candidate offset in 15-minute steps up to ``max_hours`` either
+    way, count the ``coarse`` bars whose close equals the close of the M5
+    bar ending at the same (shifted) instant. The answer must match at
+    least 90% of at least 8 comparable bars, and no other offset may match
+    half as well; otherwise ``None`` (the labels cannot be trusted)."""
+    closes = {c.timestamp + DURATION[Timeframe.M5]: c.close for c in m5_utc}
+    dur = DURATION[tf]
+    scores = []
+    for k in range(-max_hours * 4, max_hours * 4 + 1):
+        delta = timedelta(minutes=15 * k)
+        hits = total = 0
+        for c in coarse[-200:]:
+            other = closes.get(c.timestamp - delta + dur)
+            if other is None:
+                continue
+            total += 1
+            hits += abs(other - c.close) <= tolerance
+        if total:
+            scores.append((hits / total, hits, total, delta))
+    if not scores:
+        return None
+    scores.sort(key=lambda s: (s[0], s[1]), reverse=True)
+    ratio, hits, total, delta = scores[0]
+    runner_up = scores[1][0] if len(scores) > 1 else 0.0
+    if total < 8 or ratio < 0.9 or runner_up >= ratio / 2:
+        return None
+    return delta
+
+
+def relabel(candles: Sequence[Candle], delta: timedelta) -> Tuple[Candle, ...]:
+    """The same bars with ``delta`` taken off every label."""
+    if not delta:
+        return tuple(candles)
+    return tuple(Candle(c.timestamp - delta, c.open, c.high, c.low, c.close, c.volume) for c in candles)
+
+
 # -------------------------------------------------------------------- view
 
 @dataclass(frozen=True)
