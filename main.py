@@ -68,6 +68,22 @@ Leverage: cross 10x
 """
 
 
+def persistence_report(settings: Settings) -> dict:
+    """Where the database and the Telegram session actually live, for one
+    startup log line. Paths and booleans only — never file contents."""
+    db = Path(settings.storage_db_path).resolve()
+    session = Path(f"{settings.session_path}.session").resolve()
+    data = Path("/data")
+    return {
+        "storage_db": str(db), "storage_db_exists": db.exists(),
+        "storage_on_volume": storage_on_volume(db),
+        "session_file": str(session), "session_exists": session.exists(),
+        "session_on_volume": storage_on_volume(session),
+        "volume_mount": os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or None,
+        "data_dir_is_mount": os.path.ismount(data) if data.is_dir() else None,
+    }
+
+
 def storage_on_volume(path: Path) -> Optional[bool]:
     """True/False when running on Railway with a volume attached (is the
     database on it?); None when no volume is declared (local runs)."""
@@ -262,6 +278,11 @@ async def run_monitor(settings: Settings, formatter: Formatter) -> int:
     # survive a restart. A storage failure must never take down the monitor
     # any more than a bot misconfiguration can — if initialize() fails,
     # storage stays unattached and those three commands just degrade.
+    # One line that answers "is anything persisted?" without opening the
+    # dashboard: resolved paths, whether /data is a real mount, and whether
+    # the session and database files exist. Logged before anything is
+    # created, so "exists" describes what the previous run left behind.
+    log.info("persistence_check %s", " ".join(f"{k}={v}" for k, v in persistence_report(settings).items()))
     storage: Optional[Storage] = Storage(settings.storage_db_path)
     try:
         await storage.initialize()

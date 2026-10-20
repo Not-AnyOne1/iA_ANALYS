@@ -533,3 +533,24 @@ def test_shadow_tasks_are_bounded(tmp_path):
         return in_flight, dropped
 
     assert asyncio.run(go()) == (16, 5)
+
+
+def test_the_startup_persistence_line_reports_paths_only(monkeypatch, tmp_path):
+    from config import Settings
+    from main import persistence_report
+    from market_data import Timeframe as TF
+    (tmp_path / "signal_monitor.session").write_bytes(b"TEST SESSION BYTES - never logged")
+    monkeypatch.setenv("RAILWAY_VOLUME_MOUNT_PATH", str(tmp_path))
+    settings = Settings(api_id=1, api_hash="x", session_name=str(tmp_path / "signal_monitor"), phone="",
+                        target_chat="t", claude_cli_path="claude", model="", claude_max_turns=3,
+                        signal_parser_mode="off", worker_count=1, queue_maxsize=10, max_message_chars=8000,
+                        analyse_edits=False, max_retries=0, request_timeout=5.0, log_level="INFO",
+                        log_file=None, jsonl_output=None, color=False, show_json=False,
+                        storage_db_path=tmp_path / "signals.db", twelve_data_api_key="",
+                        market_data_cache_ttl=30.0, market_data_timeframe=TF.H1)
+    r = persistence_report(settings)
+    assert r["session_exists"] is True and r["session_on_volume"] is True
+    assert r["storage_on_volume"] is True and r["storage_db_exists"] is False
+    assert "TEST SESSION BYTES" not in repr(r)
+    off = replace(settings, storage_db_path=tmp_path.parent / "elsewhere.db")
+    assert persistence_report(off)["storage_on_volume"] is False
